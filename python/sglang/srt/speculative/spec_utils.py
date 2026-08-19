@@ -970,10 +970,9 @@ def commit_mamba_states_after_verify(
             # commit_gdn_replayssm_spec using its checkpoint indirection.
             commit_gdn_replayssm_circular(
                 checkpoint_state=spec_state.temporal,
-                rawv_cache=spec_state.replayssm_rawv,
-                rawk_cache=spec_state.replayssm_rawk,
+                d_cache=spec_state.replayssm_d,
+                k_cache=spec_state.replayssm_k,
                 g_cache=spec_state.replayssm_g,
-                beta_cache=spec_state.replayssm_beta,
                 state_batch_indices=state_batch_indices,
                 write_pos=mamba_pool.replayssm_write_pos,
                 cache_base=mamba_pool.replayssm_cache_base,
