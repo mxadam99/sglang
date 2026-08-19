@@ -910,6 +910,7 @@ def commit_mamba_states_after_verify(
         if batch.forward_mode.is_idle() or accept_index.numel() == 0:
             return
         from sglang.kernels.ops.attention.fla.gdn_replayssm_spec_decode import (
+            commit_gdn_replayssm_circular,
             commit_gdn_replayssm_spec,
         )
         from sglang.kernels.ops.mamba.mamba_state_scatter_triton import (
@@ -963,6 +964,25 @@ def commit_mamba_states_after_verify(
             mamba_track_indices=batch.mamba_track_indices,
             mamba_steps_to_track=mamba_steps_to_track,
         )
+        if not getattr(mamba_pool, "replayssm_spec_split", False):
+            # Plain ReplaySSM materializes only capacity and radix-boundary rows.
+            # Split-deferred mode performs the equivalent track-aware fold in
+            # commit_gdn_replayssm_spec using its checkpoint indirection.
+            commit_gdn_replayssm_circular(
+                checkpoint_state=spec_state.temporal,
+                rawv_cache=spec_state.replayssm_rawv,
+                rawk_cache=spec_state.replayssm_rawk,
+                g_cache=spec_state.replayssm_g,
+                beta_cache=spec_state.replayssm_beta,
+                state_batch_indices=state_batch_indices,
+                write_pos=mamba_pool.replayssm_write_pos,
+                cache_base=mamba_pool.replayssm_cache_base,
+                is_flush=mamba_pool.replayssm_is_flush,
+                accept_lens=accept_lens,
+                mamba_track_indices=batch.mamba_track_indices,
+                mamba_steps_to_track=mamba_steps_to_track,
+                null_block_id=-1,
+            )
         # Roll back / commit the conv state to the last accepted draft step
         # (same logic as the recurrent commit, but conv-only).
         for conv, intermediate in zip(
@@ -981,11 +1001,6 @@ def commit_mamba_states_after_verify(
                     batch.mamba_track_indices,
                     mamba_steps_to_track,
                 )
-        # NOTE: radix mamba prefix-caching (mamba_track / extra_buffer) would need
-        # a device-side force-flush so `temporal` reflects the ring before a
-        # snapshot; not wired for Part B (server_args forbids extra_buffer with
-        # --enable-linear-replayssm-spec), so the per-track scatters are intentionally
-        # skipped here.
         return
 
     # KDA ReplaySSM (fold-every-commit): KDA keeps its own recurrent verify kernel
