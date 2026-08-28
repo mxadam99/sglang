@@ -47,10 +47,10 @@ from sglang.srt.mem_cache.allocation import (
     assign_req_to_token_pool_func as assign_req_to_token_pool_func,
 )
 from sglang.srt.runtime_context import (
+    get_exec,
     get_spec,
     mamba_extra_buffer_enabled,
     mamba_extra_buffer_lazy_enabled,
-    mamba_track_grid,
     max_speculative_num_draft_tokens,
 )
 from sglang.srt.utils import (
@@ -118,8 +118,6 @@ def resolve_num_tokens_per_req(
     if phase == "target_verify":
         if num_draft_tokens is None:
             num_draft_tokens = spec.speculative_num_draft_tokens
-        if spec_algorithm.is_dflash() and not is_draft_worker:
-            num_draft_tokens = spec.speculative_dflash_verify_budget or num_draft_tokens
         return spec_algorithm.get_num_tokens_per_req_for_target_verify(
             num_draft_tokens, is_draft_worker
         )
@@ -266,12 +264,7 @@ def spec_need_hidden_states() -> bool:
     # multi_layer_eagle, DFLASH, and DSPARK don't relay hidden_states through FutureMap.
     # TODO(lsyin): also skip when step == 1.
     spec = get_spec()
-    if spec.speculative_algorithm in (
-        "STANDALONE",
-        "DFLASH",
-        "DFLASH_CONFIDENCE",
-        "DSPARK",
-    ):
+    if spec.speculative_algorithm in ("STANDALONE", "DFLASH", "DSPARK"):
         return False
     return not spec.enable_multi_layer_eagle
 
@@ -818,7 +811,7 @@ def _verify_commit_step_indices(
         return last_correct_step_indices, None
     seq_lens_pre_verify = batch.seq_lens
     seq_lens_post_verify = batch.seq_lens + accept_lens
-    mamba_track_interval = mamba_track_grid(batch.tree_cache.page_size)
+    mamba_track_interval = get_exec().mamba.mamba_track_interval
     to_track_mask = (
         seq_lens_pre_verify // mamba_track_interval
         != seq_lens_post_verify // mamba_track_interval
@@ -920,86 +913,59 @@ def commit_mamba_states_after_verify(
         spec_state = req_pool.get_speculative_mamba2_params_all_layers()
         bs = accept_lens.shape[0]
         state_batch_indices = req_pool.get_mamba_indices(batch.req_pool_indices)
+        replay_indices = batch.req_pool_indices
         last_correct_step_indices, mamba_steps_to_track = _verify_commit_step_indices(
             batch=batch,
             accept_index=accept_index,
             accept_lens=accept_lens,
             draft_token_num=draft_token_num,
         )
-        # Advance the per-slot circular cursors by the accepted count (incl. the
+        # Advance the per-request circular cursors by the accepted count (incl. the
         # bonus token). max_cache_len = ring length L = replayssm_d.shape[-2].
         commit_gdn_replayssm_spec(
-            write_pos=mamba_pool.replayssm_write_pos,
+            write_pos=mamba_pool.replayssm_spec_write_pos,
             cache_base=mamba_pool.replayssm_cache_base,
             is_flush=mamba_pool.replayssm_is_flush,
             num_accepted=accept_lens,  # [bs], includes the bonus token
-            state_batch_indices=state_batch_indices,
+            replay_indices=replay_indices,
             max_cache_len=spec_state.replayssm_d.shape[-2],
             max_spec_len=draft_token_num,
+            fold_every_commit=spec_state.temporal.dtype != torch.float32,
             null_block_id=-1,  # SGLang: valid slots >= 0, padding == -1
-            proposal_to_history=(
-                (
-                    (spec_state.replayssm_proposal_d, spec_state.replayssm_d),
-                    (spec_state.replayssm_proposal_k, spec_state.replayssm_k),
-                    (spec_state.replayssm_proposal_g, spec_state.replayssm_g),
-                    (spec_state.replayssm_proposal_rawv, spec_state.replayssm_rawv),
-                    (spec_state.replayssm_proposal_rawk, spec_state.replayssm_rawk),
-                    (spec_state.replayssm_proposal_beta, spec_state.replayssm_beta),
-                )
-                if getattr(mamba_pool, "replayssm_spec_split", False)
-                else ()
-            ),
-            checkpoint_indices=mamba_pool.replayssm_checkpoint_index,
-            split_compaction=(
-                (
-                    spec_state.temporal,
-                    spec_state.replayssm_rawv,
-                    spec_state.replayssm_rawk,
-                    spec_state.replayssm_g,
-                    spec_state.replayssm_beta,
-                )
-                if getattr(mamba_pool, "replayssm_spec_split", False)
-                else None
-            ),
+        )
+        # Capacity rows fold all layers in one launch; track rows snapshot the
+        # exact crossing state without disturbing the active circular history.
+        commit_gdn_replayssm_circular(
+            checkpoint_state=spec_state.temporal,
+            d_cache=spec_state.replayssm_d,
+            k_cache=spec_state.replayssm_k,
+            g_cache=spec_state.replayssm_g,
+            d_residual_cache=spec_state.replayssm_rawv,
+            k_residual_cache=spec_state.replayssm_rawk,
+            state_batch_indices=state_batch_indices,
+            replay_indices=replay_indices,
+            write_pos=mamba_pool.replayssm_spec_write_pos,
+            cache_base=mamba_pool.replayssm_cache_base,
+            is_flush=mamba_pool.replayssm_is_flush,
+            accept_lens=accept_lens,
             mamba_track_indices=batch.mamba_track_indices,
             mamba_steps_to_track=mamba_steps_to_track,
+            null_block_id=-1,
         )
-        if not getattr(mamba_pool, "replayssm_spec_split", False):
-            # Plain ReplaySSM materializes only capacity and radix-boundary rows.
-            # Split-deferred mode performs the equivalent track-aware fold in
-            # commit_gdn_replayssm_spec using its checkpoint indirection.
-            commit_gdn_replayssm_circular(
-                checkpoint_state=spec_state.temporal,
-                d_cache=spec_state.replayssm_d,
-                k_cache=spec_state.replayssm_k,
-                g_cache=spec_state.replayssm_g,
-                state_batch_indices=state_batch_indices,
-                write_pos=mamba_pool.replayssm_write_pos,
-                cache_base=mamba_pool.replayssm_cache_base,
-                is_flush=mamba_pool.replayssm_is_flush,
-                accept_lens=accept_lens,
-                mamba_track_indices=batch.mamba_track_indices,
-                mamba_steps_to_track=mamba_steps_to_track,
-                null_block_id=-1,
-            )
-        # Roll back / commit the conv state to the last accepted draft step
-        # (same logic as the recurrent commit, but conv-only).
-        for conv, intermediate in zip(
-            spec_state.conv, spec_state.intermediate_conv_window
-        ):
+        # Roll back active conv state and snapshot its interval-crossing window.
+        fused_conv_window_scatter_with_mask(
+            spec_state.conv[0],
+            spec_state.intermediate_conv_window[0],
+            state_batch_indices,
+            last_correct_step_indices,
+        )
+        if batch.mamba_track_indices is not None:
             fused_conv_window_scatter_with_mask(
-                conv,
-                intermediate,
-                state_batch_indices,
-                last_correct_step_indices,
+                spec_state.conv[0],
+                spec_state.intermediate_conv_window[0],
+                batch.mamba_track_indices,
+                mamba_steps_to_track,
             )
-            if batch.mamba_track_indices is not None:
-                fused_conv_window_scatter_with_mask(
-                    conv,
-                    intermediate,
-                    batch.mamba_track_indices,
-                    mamba_steps_to_track,
-                )
         return
 
     # KDA ReplaySSM (fold-every-commit): KDA keeps its own recurrent verify kernel
@@ -1041,7 +1007,7 @@ def commit_mamba_states_after_verify(
         mamba_track_indices = batch.mamba_track_indices
         mamba_steps_to_track = None
         if mamba_track_indices is not None:
-            ti = mamba_track_grid(batch.tree_cache.page_size)
+            ti = get_exec().mamba.mamba_track_interval
             seq_pre = batch.seq_lens
             seq_post = batch.seq_lens + accept_lens
             to_track_mask = seq_pre // ti != seq_post // ti
@@ -1093,7 +1059,7 @@ def spec_prepare_for_decode(batch: ScheduleBatch) -> None:
     if mamba_extra_buffer_lazy_enabled():
         # Scheduler phase (outside forward isolation).
         batch.mamba_lazy_spec_prepare(
-            mamba_track_grid(batch.tree_cache.page_size),
+            get_exec().mamba.mamba_track_interval,
             max_speculative_num_draft_tokens(),
         )
     if batch.spec_algorithm.is_dflash_family():
