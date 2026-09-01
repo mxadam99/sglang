@@ -1512,6 +1512,10 @@ class Envs:
     SGLANG_SYMM_MEM_PREALLOC_GB_SIZE = EnvInt(-1)
     SGLANG_DEBUG_SYMM_MEM = EnvBool(False)
 
+    # Qwen3.5/Qwen3.8 GDN: pad small-M in_proj_ba GEMMs past an SM120
+    # cuBLAS heuristic cliff. The model-side guard makes this a no-op elsewhere.
+    SGLANG_ENABLE_GDN_BA_PAD = EnvBool(True)
+
     # ===================================================================
     # Plugin system
     # ===================================================================
