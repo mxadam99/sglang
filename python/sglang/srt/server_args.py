@@ -2208,6 +2208,21 @@ class ServerArgs:
         "DFLASH only. Commit accepted hybrid-GDN state on a dedicated CUDA stream and overlap it with the next draft proposal.",
         NS("spec"),
     ] = False
+    speculative_dflash_suffix_oracle: A[
+        bool,
+        "DFLASH only. Use a bounded committed-output suffix corpus as a first proposal source and run the draft model only for miss rows. Greedy decoding only.",
+        NS("spec"),
+    ] = False
+    speculative_dflash_suffix_max_depth: A[
+        int,
+        "Maximum committed-token suffix length used by the DFLASH suffix oracle.",
+        NS("spec"),
+    ] = 32
+    speculative_dflash_suffix_capacity: A[
+        int,
+        "Maximum token capacity of the bounded DFLASH suffix oracle corpus.",
+        NS("spec"),
+    ] = 1000000
     speculative_dspark_block_size: A[
         Optional[int],
         "DSPARK only. Draft block size gamma (number of proposed draft tokens). The verify window is gamma + 1, so this sets --speculative-num-draft-tokens = gamma + 1. Omit to auto-infer gamma from the draft checkpoint block_size.",
@@ -2779,8 +2794,8 @@ class ServerArgs:
     linear_replayssm_spec_mode: A[
         str,
         Arg(
-            help="ReplaySSM speculative state policy: eager_fold materializes every accepted verify prefix; deferred retains a bounded exact raw-input log and folds only before overflow.",
-            choices=["eager_fold", "deferred"],
+            help="ReplaySSM speculative state policy: eager_fold materializes every accepted verify prefix; deferred uses the legacy shared circular window; split_deferred separates the bounded committed log from proposal scratch so L may be smaller than 2K.",
+            choices=["eager_fold", "deferred", "split_deferred"],
         ),
         NS("exec.mamba"),
     ] = "eager_fold"
@@ -6882,6 +6897,17 @@ class ServerArgs:
         # --linear-replayssm-cache-len window and folds via its own fused
         # verify ring-write + commit_kda_replayssm_after_verify.
         if cfg.enable_linear_replayssm_spec:
+            if (
+                cfg.linear_replayssm_spec_mode in ("deferred", "split_deferred")
+                and cfg.linear_replayssm_cache_len
+                & (cfg.linear_replayssm_cache_len - 1)
+                != 0
+            ):
+                raise ValueError(
+                    "deferred ReplaySSM requires a power-of-two committed-log "
+                    "length; got --linear-replayssm-cache-len="
+                    f"{cfg.linear_replayssm_cache_len}."
+                )
             if cfg.linear_replayssm_spec_mode == "deferred":
                 draft_tokens = cfg.speculative_num_draft_tokens or 1
                 if cfg.linear_replayssm_cache_len < 2 * draft_tokens:
@@ -6889,6 +6915,13 @@ class ServerArgs:
                         "deferred ReplaySSM requires --linear-replayssm-cache-len "
                         "to be at least twice the maximum verify width: "
                         f"{cfg.linear_replayssm_cache_len} < 2 * {draft_tokens}."
+                    )
+            elif cfg.linear_replayssm_spec_mode == "split_deferred":
+                if cfg.linear_replayssm_cache_len < 1:
+                    raise ValueError(
+                        "split-deferred ReplaySSM requires a non-empty committed "
+                        "log; got --linear-replayssm-cache-len="
+                        f"{cfg.linear_replayssm_cache_len}."
                     )
                 if not cfg.disable_radix_cache:
                     raise ValueError(
@@ -9910,10 +9943,7 @@ class ServerArgs:
             return memo
         if cfg.speculative_num_draft_tokens is None:
             result = None
-        elif (
-            not cfg.speculative_adaptive
-            or cfg.speculative_algorithm == "DFLASH"
-        ):
+        elif not cfg.speculative_adaptive or cfg.speculative_algorithm == "DFLASH":
             result = cfg.speculative_num_draft_tokens
         else:
             from sglang.srt.speculative.adaptive_spec_params import (

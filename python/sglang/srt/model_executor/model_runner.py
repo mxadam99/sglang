@@ -1657,10 +1657,12 @@ class ModelRunner:
                 )
             else:
                 # mamba_pool is a pure PHYSICAL store; translate both COW slot ids.
-                pool.mamba_pool.copy_from(
-                    pool.translate_mamba_indices(forward_batch.mamba_cow_src_indices),
-                    pool.translate_mamba_indices(forward_batch.mamba_cow_dst_indices),
-                )
+                src = pool.translate_mamba_indices(forward_batch.mamba_cow_src_indices)
+                dst = pool.translate_mamba_indices(forward_batch.mamba_cow_dst_indices)
+                if getattr(pool.mamba_pool, "replayssm_spec_split", False):
+                    pool.mamba_pool.share_checkpoint_from(src, dst)
+                else:
+                    pool.mamba_pool.copy_from(src, dst)
         forward_batch.mamba_clear_indices = None
         forward_batch.mamba_cow_src_indices = None
         forward_batch.mamba_cow_dst_indices = None
@@ -1762,6 +1764,20 @@ class ModelRunner:
                 and self.pp_group.is_last_rank
             ):
                 forward_batch.post_forward_mlp_sync_batch(ret)
+
+            mamba_pool = getattr(self.req_to_token_pool, "mamba_pool", None)
+            checkpoint_indices = getattr(mamba_pool, "replayssm_checkpoint_index", None)
+            if (
+                checkpoint_indices is not None
+                and forward_batch.forward_mode.is_extend()
+                and not forward_batch.forward_mode.is_target_verify()
+                and not forward_batch.forward_mode.is_draft_extend_v2()
+            ):
+                active = self.req_to_token_pool.get_mamba_indices(
+                    forward_batch.req_pool_indices
+                )
+                active = self.req_to_token_pool.translate_mamba_indices(active)
+                checkpoint_indices[active] = active
 
             return ModelRunnerOutput(logits_output=ret, can_run_graph=can_run_graph)
 

@@ -756,8 +756,10 @@ class UnifiedMambaPool(MambaPool):
         self.enable_linear_replayssm_spec = False
         self.linear_replayssm_spec_mode = "eager_fold"
         self.replayssm_spec_fold = False
+        self.replayssm_spec_split = False
         self.replayssm_cache_base = None
         self.replayssm_is_flush = None
+        self.replayssm_checkpoint_index = None
         self.debug_memory_pool = False
         self.conv_shard_groups = None
         self.conv_slice_axis = spec.conv_slice_axis

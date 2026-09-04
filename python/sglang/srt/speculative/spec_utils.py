@@ -119,9 +119,7 @@ def resolve_num_tokens_per_req(
         if num_draft_tokens is None:
             num_draft_tokens = spec.speculative_num_draft_tokens
         if spec_algorithm.is_dflash() and not is_draft_worker:
-            num_draft_tokens = (
-                spec.speculative_dflash_verify_budget or num_draft_tokens
-            )
+            num_draft_tokens = spec.speculative_dflash_verify_budget or num_draft_tokens
         return spec_algorithm.get_num_tokens_per_req_for_target_verify(
             num_draft_tokens, is_draft_worker
         )
@@ -916,6 +914,12 @@ def commit_mamba_states_after_verify(
         spec_state = req_pool.get_speculative_mamba2_params_all_layers()
         bs = accept_lens.shape[0]
         state_batch_indices = req_pool.get_mamba_indices(batch.req_pool_indices)
+        last_correct_step_indices, mamba_steps_to_track = _verify_commit_step_indices(
+            batch=batch,
+            accept_index=accept_index,
+            accept_lens=accept_lens,
+            draft_token_num=draft_token_num,
+        )
         # Advance the per-slot circular cursors by the accepted count (incl. the
         # bonus token). max_cache_len = ring length L = replayssm_d.shape[-2].
         commit_gdn_replayssm_spec(
@@ -927,21 +931,51 @@ def commit_mamba_states_after_verify(
             max_cache_len=spec_state.replayssm_d.shape[-2],
             max_spec_len=draft_token_num,
             null_block_id=-1,  # SGLang: valid slots >= 0, padding == -1
+            proposal_to_history=(
+                (
+                    (spec_state.replayssm_proposal_d, spec_state.replayssm_d),
+                    (spec_state.replayssm_proposal_k, spec_state.replayssm_k),
+                    (spec_state.replayssm_proposal_g, spec_state.replayssm_g),
+                    (spec_state.replayssm_proposal_rawv, spec_state.replayssm_rawv),
+                    (spec_state.replayssm_proposal_rawk, spec_state.replayssm_rawk),
+                    (spec_state.replayssm_proposal_beta, spec_state.replayssm_beta),
+                )
+                if getattr(mamba_pool, "replayssm_spec_split", False)
+                else ()
+            ),
+            checkpoint_indices=mamba_pool.replayssm_checkpoint_index,
+            split_compaction=(
+                (
+                    spec_state.temporal,
+                    spec_state.replayssm_rawv,
+                    spec_state.replayssm_rawk,
+                    spec_state.replayssm_g,
+                    spec_state.replayssm_beta,
+                )
+                if getattr(mamba_pool, "replayssm_spec_split", False)
+                else None
+            ),
+            mamba_track_indices=batch.mamba_track_indices,
+            mamba_steps_to_track=mamba_steps_to_track,
         )
         # Roll back / commit the conv state to the last accepted draft step
         # (same logic as the recurrent commit, but conv-only).
-        last_correct_step_indices, _ = _verify_commit_step_indices(
-            batch=batch,
-            accept_index=accept_index,
-            accept_lens=accept_lens,
-            draft_token_num=draft_token_num,
-        )
-        fused_conv_window_scatter_with_mask(
-            spec_state.conv[0],
-            spec_state.intermediate_conv_window[0],
-            state_batch_indices,
-            last_correct_step_indices,
-        )
+        for conv, intermediate in zip(
+            spec_state.conv, spec_state.intermediate_conv_window
+        ):
+            fused_conv_window_scatter_with_mask(
+                conv,
+                intermediate,
+                state_batch_indices,
+                last_correct_step_indices,
+            )
+            if batch.mamba_track_indices is not None:
+                fused_conv_window_scatter_with_mask(
+                    conv,
+                    intermediate,
+                    batch.mamba_track_indices,
+                    mamba_steps_to_track,
+                )
         # NOTE: radix mamba prefix-caching (mamba_track / extra_buffer) would need
         # a device-side force-flush so `temporal` reflects the ring before a
         # snapshot; not wired for Part B (server_args forbids extra_buffer with

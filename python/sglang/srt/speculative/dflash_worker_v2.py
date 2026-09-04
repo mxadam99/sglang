@@ -4,6 +4,7 @@ import time
 from dataclasses import replace
 from typing import List, Optional, Tuple
 
+import numpy as np
 import torch
 
 from sglang.kernels.ops.speculative.cache_locs import (
@@ -45,11 +46,11 @@ from sglang.srt.runtime_context import (
     mamba_track_grid,
 )
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
 from sglang.srt.speculative.adaptive_runtime_state import (
     AdaptiveController,
     SpecRuntimeState,
 )
+from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 from sglang.srt.speculative.dflash_utils import (
@@ -368,6 +369,19 @@ class DFlashWorkerV2(BaseSpecWorker):
         self.verify_budget = int(
             get_spec().speculative_dflash_verify_budget or self.block_size
         )
+        self._suffix_corpus = None
+        self._suffix_prev_rids: set[str] = set()
+        if get_spec().speculative_dflash_suffix_oracle:
+            from sglang.srt.speculative.cpp_ngram.ngram_corpus import NgramCorpus
+
+            self._suffix_corpus = NgramCorpus(
+                max_trie_depth=get_spec().speculative_dflash_suffix_max_depth,
+                min_bfs_breadth=1,
+                max_bfs_breadth=1,
+                draft_token_num=self.block_size,
+                match_type="PROB",
+                capacity=get_spec().speculative_dflash_suffix_capacity,
+            )
         self.adaptive_controller: Optional[AdaptiveController] = None
         if get_spec().speculative_adaptive:
             self.adaptive_controller = AdaptiveController(
@@ -851,7 +865,66 @@ class DFlashWorkerV2(BaseSpecWorker):
         # sliding-window path, the draft req->token view is rebuilt from committed
         # target state before each draft forward, so there is nothing persistent
         # to flush here.
-        pass
+        if self._suffix_corpus is not None:
+            self._suffix_corpus.reset()
+            self._suffix_prev_rids.clear()
+
+    def _suffix_oracle_candidates(self, batch: ScheduleBatch):
+        """Return full-chain committed suffix hits and miss row indices.
+
+        Corpus lookup stays on the scheduler CPU, but candidate transfer is
+        asynchronous. Only greedy, grammar-free batches are eligible: greedy
+        target verification makes an arbitrary proposal distribution exact,
+        while stochastic acceptance would require an oracle q-distribution.
+        """
+        corpus = self._suffix_corpus
+        if (
+            corpus is None
+            or batch.has_grammar
+            or not _is_all_greedy(batch.sampling_info)
+        ):
+            return None
+
+        depth = get_spec().speculative_dflash_suffix_max_depth
+        tails = [
+            (list(req.origin_input_ids) + list(req.output_ids))[-depth:]
+            for req in batch.reqs
+        ]
+        if any(not tail for tail in tails):
+            return None
+        corpus.synchronize()
+        ids, masks = corpus.batch_get(
+            [req.rid for req in batch.reqs],
+            tails,
+            [len(req.origin_input_ids) + len(req.output_ids) for req in batch.reqs],
+        )
+        # Learn only committed output streams, after querying them, so prompt
+        # text never becomes an oracle source and a tail cannot manufacture its
+        # own continuation in the same round.
+        committed = [list(req.output_ids[-depth:]) for req in batch.reqs]
+        committed = [tokens for tokens in committed if len(tokens) >= 2]
+        if committed:
+            corpus.batch_put(committed)
+
+        bs = len(batch.reqs)
+        width = self.block_size
+        budget = self.verify_budget
+        tree = masks.reshape(bs, width, width)
+        hit = tree[:, budget - 1, :budget].all(axis=1)
+        current_rids = {req.rid for req in batch.reqs}
+        departed = self._suffix_prev_rids - current_rids
+        if departed:
+            corpus.erase_match_state(list(departed))
+        self._suffix_prev_rids = current_rids
+        if not bool(hit.any()):
+            return None
+
+        hit_rows = np.flatnonzero(hit).tolist()
+        miss_rows = np.flatnonzero(~hit).tolist()
+        proposals = torch.from_numpy(ids.reshape(bs, width)).to(
+            self.device, dtype=torch.int64, non_blocking=True
+        )
+        return proposals, hit_rows, miss_rows
 
     def _gather_req_to_token_masked(
         self,
@@ -2066,11 +2139,6 @@ class DFlashWorkerV2(BaseSpecWorker):
             )
             verify_out_cache_loc_2d.copy_(verify_out_cache_loc.view(bs, block_size))
 
-        noise_embedding = embed_module(block_ids)
-        if self._noise_embed_scale != 1.0:
-            noise_embedding = noise_embedding * self._noise_embed_scale
-        input_embeds = noise_embedding.view(-1, noise_embedding.shape[-1])
-
         positions = positions_2d.reshape(-1)
         verify_out_cache_loc = verify_out_cache_loc_2d.reshape(-1)
 
@@ -2112,67 +2180,122 @@ class DFlashWorkerV2(BaseSpecWorker):
                 seq_lens_cpu.copy_(prefix_lens.to("cpu", dtype=torch.int32))
                 draft_seq_lens_sum = int(prefix_lens.sum().item())
 
-        forward_batch = ForwardBatch(
-            forward_mode=ForwardMode.TARGET_VERIFY,
-            batch_size=bs,
-            input_ids=block_ids.flatten(),
-            req_pool_indices=batch.req_pool_indices,
-            seq_lens=draft_seq_lens,
-            out_cache_loc=verify_out_cache_loc,
-            seq_lens_sum=draft_seq_lens_sum,
-            seq_lens_cpu=seq_lens_cpu,
-            positions=positions,
-            input_embeds=input_embeds,
-            spec_algorithm=SpeculativeAlgorithm.DFLASH,
-            spec_info=self._draft_block_spec_info,
-            capture_hidden_mode=CaptureHiddenMode.NULL,
-        )
-
-        if self.selector is not None:
-            self._selector_sample = None
-            if self._draft_sampler is not None:
-                # Consumed by the in-graph sample; must be staged before the replay.
-                self._draft_sampler.stage_sampling_params(
-                    bs=bs, sampling_info=batch.sampling_info
-                )
-
-        with torch.inference_mode():
-            draft_out = self.draft_model_runner.forward(forward_batch)
-        draft_logits_output = draft_out.logits_output
-
-        folded = self._draft_sampler is not None and draft_out.can_run_graph
-        if folded:
-            draft_next = self._draft_sampler.out[
-                : bs * (int(self.block_size) - 1)
-            ].view(bs, int(self.block_size) - 1)
-            if self.selector is not None and not _is_all_greedy(batch.sampling_info):
-                self._selector_sample = (
-                    self._draft_sampler.candidate_out[:bs],
-                    self._draft_sampler.q_out[:bs],
-                )
-        elif self.selector is not None:
-            draft_next = self._propose_selector_block(
-                draft_logits_output=draft_logits_output,
-                bs=bs,
-                lm_head=lm_head,
-                anchor_token_ids=block_ids[:, 0],
-                sampling_info=batch.sampling_info,
-            )
-        else:
-            draft_hidden = draft_logits_output.hidden_states
-            if draft_hidden is None:
-                raise RuntimeError("DFLASH draft model returned no hidden states.")
-            draft_hidden = draft_hidden.view(bs, int(self.block_size), -1)
-            draft_next = self._greedy_sample_from_vocab_parallel_head(
-                hidden_states=draft_hidden[:, 1:, :].reshape(
-                    -1, draft_hidden.shape[-1]
-                ),
-                lm_head=lm_head,
-            ).view(bs, int(self.block_size) - 1)
-
         draft_tokens = self._draft_block_tokens_buf[:bs]
         draft_tokens[:, 0].copy_(block_ids[:, 0])
-        draft_tokens[:, 1:].copy_(draft_next)
+        oracle = self._suffix_oracle_candidates(batch)
+        oracle_tokens = None
+        hit_rows: list[int] = []
+        miss_rows = list(range(bs))
+        if oracle is not None:
+            oracle_tokens, hit_rows, miss_rows = oracle
+            hit_index = torch.tensor(hit_rows, device=device, dtype=torch.int64)
+            draft_tokens[hit_index] = oracle_tokens[hit_index]
+            # The authoritative bonus token is device-resident and may be one
+            # scheduler iteration newer than the host request tail.
+            draft_tokens[hit_index, 0] = block_ids[hit_index, 0]
+
+        # Miss compaction is graph-safe only when the captured sampler owns the
+        # draft head. Eager fallback still gets the acceptance benefit by
+        # drafting the full batch and overwriting suffix-hit rows below.
+        compact_misses = oracle is not None and self._draft_sampler is not None
+        draft_rows = miss_rows if compact_misses else list(range(bs))
+        draft_bs = len(draft_rows)
+        self._selector_sample = None
+        if draft_bs:
+            if draft_bs == bs:
+                row_index = None
+                draft_block_ids = block_ids
+                draft_positions = positions
+                draft_cache_loc = verify_out_cache_loc
+                draft_req_pool_indices = batch.req_pool_indices
+                selected_seq_lens = draft_seq_lens
+                selected_seq_lens_cpu = seq_lens_cpu
+                selected_seq_lens_sum = draft_seq_lens_sum
+            else:
+                row_index = torch.tensor(draft_rows, device=device, dtype=torch.int64)
+                row_index_cpu = torch.tensor(
+                    draft_rows, device="cpu", dtype=torch.int64
+                )
+                draft_block_ids = block_ids.index_select(0, row_index)
+                draft_positions = positions_2d.index_select(0, row_index).reshape(-1)
+                draft_cache_loc = verify_out_cache_loc_2d.index_select(
+                    0, row_index
+                ).reshape(-1)
+                draft_req_pool_indices = batch.req_pool_indices.index_select(
+                    0, row_index
+                )
+                selected_seq_lens = draft_seq_lens.index_select(0, row_index)
+                selected_seq_lens_cpu = seq_lens_cpu.index_select(0, row_index_cpu)
+                selected_seq_lens_sum = int(selected_seq_lens_cpu.sum())
+
+            noise_embedding = embed_module(draft_block_ids)
+            if self._noise_embed_scale != 1.0:
+                noise_embedding = noise_embedding * self._noise_embed_scale
+            input_embeds = noise_embedding.view(-1, noise_embedding.shape[-1])
+            forward_batch = ForwardBatch(
+                forward_mode=ForwardMode.TARGET_VERIFY,
+                batch_size=draft_bs,
+                input_ids=draft_block_ids.flatten(),
+                req_pool_indices=draft_req_pool_indices,
+                seq_lens=selected_seq_lens,
+                out_cache_loc=draft_cache_loc,
+                seq_lens_sum=selected_seq_lens_sum,
+                seq_lens_cpu=selected_seq_lens_cpu,
+                positions=draft_positions,
+                input_embeds=input_embeds,
+                spec_algorithm=SpeculativeAlgorithm.DFLASH,
+                spec_info=self._draft_block_spec_info,
+                capture_hidden_mode=CaptureHiddenMode.NULL,
+            )
+
+            if self.selector is not None and self._draft_sampler is not None:
+                self._draft_sampler.stage_sampling_params(
+                    bs=draft_bs, sampling_info=batch.sampling_info
+                )
+
+            with torch.inference_mode():
+                draft_out = self.draft_model_runner.forward(forward_batch)
+            draft_logits_output = draft_out.logits_output
+            folded = self._draft_sampler is not None and draft_out.can_run_graph
+            if folded:
+                draft_next = self._draft_sampler.out[
+                    : draft_bs * (int(self.block_size) - 1)
+                ].view(draft_bs, int(self.block_size) - 1)
+                if self.selector is not None and not _is_all_greedy(
+                    batch.sampling_info
+                ):
+                    self._selector_sample = (
+                        self._draft_sampler.candidate_out[:draft_bs],
+                        self._draft_sampler.q_out[:draft_bs],
+                    )
+            elif self.selector is not None:
+                draft_next = self._propose_selector_block(
+                    draft_logits_output=draft_logits_output,
+                    bs=draft_bs,
+                    lm_head=lm_head,
+                    anchor_token_ids=draft_block_ids[:, 0],
+                    sampling_info=batch.sampling_info,
+                )
+            else:
+                draft_hidden = draft_logits_output.hidden_states
+                if draft_hidden is None:
+                    raise RuntimeError("DFLASH draft model returned no hidden states.")
+                draft_hidden = draft_hidden.view(draft_bs, int(self.block_size), -1)
+                draft_next = self._greedy_sample_from_vocab_parallel_head(
+                    hidden_states=draft_hidden[:, 1:, :].reshape(
+                        -1, draft_hidden.shape[-1]
+                    ),
+                    lm_head=lm_head,
+                ).view(draft_bs, int(self.block_size) - 1)
+
+            if row_index is None:
+                draft_tokens[:, 1:].copy_(draft_next)
+            else:
+                draft_tokens[row_index, 1:] = draft_next
+            if oracle_tokens is not None:
+                hit_index = torch.tensor(hit_rows, device=device, dtype=torch.int64)
+                draft_tokens[hit_index] = oracle_tokens[hit_index]
+                draft_tokens[hit_index, 0] = block_ids[hit_index, 0]
 
         # --- 2) Target verify.
         # TARGET_VERIFY uses standard causal masking; custom masks are unnecessary here.
@@ -2184,9 +2307,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         assert self._verify_out_cache_loc_buf is not None
         verify_tokens = self._verify_tokens_buf[:bs, :verify_budget]
         verify_positions_2d = self._verify_positions_buf[:bs, :verify_budget]
-        verify_out_cache_loc_2d = self._verify_out_cache_loc_buf[
-            :bs, :verify_budget
-        ]
+        verify_out_cache_loc_2d = self._verify_out_cache_loc_buf[:bs, :verify_budget]
         verify_tokens.copy_(draft_tokens[:, :verify_budget])
         verify_positions_2d.copy_(positions_2d[:, :verify_budget])
         verify_out_cache_loc_2d.copy_(

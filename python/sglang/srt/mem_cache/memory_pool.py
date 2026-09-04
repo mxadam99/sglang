@@ -403,6 +403,16 @@ class MambaPool:
         replayssm_rawv: Optional[torch.Tensor] = None
         replayssm_rawk: Optional[torch.Tensor] = None
         replayssm_beta: Optional[torch.Tensor] = None
+        # Split-deferred spec mode keeps the committed L-token history above
+        # separate from the current K-token proposal. This removes the old
+        # L >= 2K aliasing constraint and makes a small committed log usable
+        # with wide DFlash verification windows.
+        replayssm_proposal_d: Optional[torch.Tensor] = None
+        replayssm_proposal_k: Optional[torch.Tensor] = None
+        replayssm_proposal_g: Optional[torch.Tensor] = None
+        replayssm_proposal_rawv: Optional[torch.Tensor] = None
+        replayssm_proposal_rawk: Optional[torch.Tensor] = None
+        replayssm_proposal_beta: Optional[torch.Tensor] = None
 
         def at_layer_idx(self, layer: int):
             kwargs = {}
@@ -543,9 +553,14 @@ class MambaPool:
         self.enable_linear_replayssm_spec = enable_linear_replayssm_spec
         self.linear_replayssm_spec_mode = linear_replayssm_spec_mode
         self.replayssm_spec_fold = bool(
-            enable_linear_replayssm_spec
-            and linear_replayssm_spec_mode == "eager_fold"
+            enable_linear_replayssm_spec and linear_replayssm_spec_mode == "eager_fold"
         )
+        self.replayssm_spec_split = bool(
+            enable_linear_replayssm_spec
+            and linear_replayssm_spec_mode == "split_deferred"
+        )
+        if self.replayssm_spec_split and cache_params.is_kda:
+            raise ValueError("split-deferred ReplaySSM currently supports GDN only")
         _replayssm_on = enable_linear_replayssm or enable_linear_replayssm_spec
 
         # for disagg with nvlink
@@ -630,6 +645,8 @@ class MambaPool:
             # (--enable-linear-replayssm-spec) shares this allocation.
             replayssm_d = replayssm_k = replayssm_g = None
             replayssm_rawv = replayssm_rawk = replayssm_beta = None
+            proposal_d = proposal_k = proposal_g = None
+            proposal_rawv = proposal_rawk = proposal_beta = None
             if _replayssm_on:
                 hv, v_dim, k_dim = temporal_state_shape
                 h_k = getattr(cache_params.shape, "num_k_heads_per_tp", hv)
@@ -722,6 +739,28 @@ class MambaPool:
                         dtype=torch.float32,
                         device=device,
                     )
+                    if self.replayssm_spec_split and not cache_params.is_kda:
+                        proposal_len = speculative_num_draft_tokens or 1
+                        proposal_d = torch.zeros(
+                            (num_mamba_layers, num_slots, hv, proposal_len, v_dim),
+                            dtype=ring_dtype,
+                            device=device,
+                        )
+                        proposal_k = torch.zeros(
+                            (num_mamba_layers, num_slots, h_k, proposal_len, k_dim),
+                            dtype=ring_dtype,
+                            device=device,
+                        )
+                        proposal_g = torch.zeros(
+                            (num_mamba_layers, num_slots, hv, proposal_len),
+                            dtype=torch.float32,
+                            device=device,
+                        )
+                        proposal_rawv = torch.zeros_like(proposal_d, dtype=conv_dtype)
+                        proposal_rawk = torch.zeros_like(proposal_k, dtype=conv_dtype)
+                        proposal_beta = torch.zeros_like(
+                            proposal_g, dtype=torch.float32
+                        )
 
             if speculative_num_draft_tokens is not None:
                 if _is_npu:
@@ -843,6 +882,12 @@ class MambaPool:
                     replayssm_rawv=replayssm_rawv,
                     replayssm_rawk=replayssm_rawk,
                     replayssm_beta=replayssm_beta,
+                    replayssm_proposal_d=proposal_d,
+                    replayssm_proposal_k=proposal_k,
+                    replayssm_proposal_g=proposal_g,
+                    replayssm_proposal_rawv=proposal_rawv,
+                    replayssm_proposal_rawk=proposal_rawk,
+                    replayssm_proposal_beta=proposal_beta,
                 )
                 intermediate_ssm_gb = (
                     get_tensor_size_bytes(intermediate_ssm_state_cache) / GB
@@ -918,6 +963,14 @@ class MambaPool:
                 if enable_linear_replayssm_spec and not self.replayssm_spec_fold
                 else None
             )
+            # Active split-deferred slots may borrow an immutable temporal
+            # checkpoint from a locked radix node while keeping private conv
+            # state and delta pages. Identity means the slot owns its checkpoint.
+            self.replayssm_checkpoint_index = (
+                torch.arange(size + 1, dtype=torch.int64, device=device)
+                if self.replayssm_spec_split
+                else None
+            )
             mem_usage_bytes = self.mamba_cache.mem_usage_bytes()
             if isinstance(self.mamba_cache, self.SpeculativeState):
                 # `intermediate_conv_window` is an as_strided view whose logical
@@ -979,6 +1032,8 @@ class MambaPool:
             temporal = self.mamba_cache.temporal
             if temporal.numel() > 0:
                 temporal[:, indices] = 0
+            if self.replayssm_checkpoint_index is not None:
+                self.replayssm_checkpoint_index[indices] = indices
             return
         if not _is_npu:
             need_size = len(indices)
@@ -999,6 +1054,27 @@ class MambaPool:
                 t[:, indices] = 0
             t = self.mamba_cache.temporal
             t[:, indices] = 0
+        if self.replayssm_checkpoint_index is not None:
+            self.replayssm_checkpoint_index[indices] = indices
+
+    def share_checkpoint_from(
+        self, src_indices: torch.Tensor, dst_indices: torch.Tensor
+    ) -> None:
+        """Copy the small conv state and borrow an immutable temporal checkpoint."""
+        assert self.replayssm_checkpoint_index is not None
+        if self._should_fuse_slot_ops():
+            from sglang.srt.mem_cache.mamba_slot_fused import fused_copy_conv_slots
+
+            fused_copy_conv_slots(self._conv_slot_desc, src_indices, dst_indices)
+        else:
+            for conv in self.mamba_cache.conv:
+                conv[:, dst_indices] = conv[:, src_indices]
+        self.replayssm_checkpoint_index[dst_indices] = self.replayssm_checkpoint_index[
+            src_indices
+        ]
+        self.replayssm_write_pos[dst_indices] = 0
+        self.replayssm_cache_base[dst_indices] = 0
+        self.replayssm_is_flush[dst_indices] = 0
 
     def copy_from(self, src_indices: torch.Tensor, dst_indices: torch.Tensor):
         """Clone mamba state (conv + temporal) from src slots into dst slots.
@@ -1031,15 +1107,27 @@ class MambaPool:
             fused_copy_conv_slots(self._conv_slot_desc, src_indices, dst_indices)
             temporal = self.mamba_cache.temporal
             if temporal.numel() > 0:
-                temporal[:, dst_indices] = temporal[:, src_indices]
+                temporal_src = (
+                    self.replayssm_checkpoint_index[src_indices]
+                    if self.replayssm_checkpoint_index is not None
+                    else src_indices
+                )
+                temporal[:, dst_indices] = temporal[:, temporal_src]
         else:
             for i in range(len(self.mamba_cache.conv)):
                 self.mamba_cache.conv[i][:, dst_indices] = self.mamba_cache.conv[i][
                     :, src_indices
                 ]
+            temporal_src = (
+                self.replayssm_checkpoint_index[src_indices]
+                if self.replayssm_checkpoint_index is not None
+                else src_indices
+            )
             self.mamba_cache.temporal[:, dst_indices] = self.mamba_cache.temporal[
-                :, src_indices
+                :, temporal_src
             ]
+        if self.replayssm_checkpoint_index is not None:
+            self.replayssm_checkpoint_index[dst_indices] = dst_indices
         if self.replayssm_write_pos is not None:
             self.replayssm_write_pos[dst_indices] = 0
         # ReplaySSM spec-verify ring: a copied checkpoint has no pending ring

@@ -212,10 +212,7 @@ def handle_speculative_decoding(server_args: ServerArgs) -> None:
         # DFlash owns a fixed, trained draft block. Its adaptive controller
         # changes only the target verify prefix after _handle_dflash resolves
         # that block; the EAGLE initializer would incorrectly rewrite it.
-        if (
-            cfg.speculative_adaptive
-            and cfg.speculative_algorithm != "DFLASH"
-        ):
+        if cfg.speculative_adaptive and cfg.speculative_algorithm != "DFLASH":
             _init_adaptive_speculative_params(server_args)
 
     if algo is not None:
@@ -319,6 +316,24 @@ def _handle_dflash(server_args: ServerArgs) -> None:
             speculative_num_draft_tokens=int(cfg.speculative_dflash_block_size),
         )
 
+    if cfg.speculative_dflash_suffix_oracle:
+        if not cfg.disable_overlap_schedule:
+            raise ValueError(
+                "--speculative-dflash-suffix-oracle currently requires "
+                "--disable-overlap-schedule so the committed request tails are "
+                "visible before the next corpus lookup."
+            )
+        if cfg.speculative_dflash_suffix_max_depth < 2:
+            raise ValueError(
+                "--speculative-dflash-suffix-max-depth must be >= 2, got "
+                f"{cfg.speculative_dflash_suffix_max_depth}."
+            )
+        if cfg.speculative_dflash_suffix_capacity < 1:
+            raise ValueError(
+                "--speculative-dflash-suffix-capacity must be positive, got "
+                f"{cfg.speculative_dflash_suffix_capacity}."
+            )
+
     if cfg.speculative_num_draft_tokens is None:
         from sglang.srt.speculative.dflash_utils import (
             parse_dflash_draft_config,
@@ -357,9 +372,7 @@ def _handle_dflash(server_args: ServerArgs) -> None:
             speculative_num_draft_tokens=inferred_block_size,
         )
 
-    draft_block_size = int(
-        resolving_view(server_args).speculative_num_draft_tokens
-    )
+    draft_block_size = int(resolving_view(server_args).speculative_num_draft_tokens)
     server_args.speculative_dflash_verify_budget = _resolve_dflash_verify_budget(
         server_args, draft_block_size
     )

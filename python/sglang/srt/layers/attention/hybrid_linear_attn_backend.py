@@ -1254,9 +1254,8 @@ class HybridLinearAttnBackend(AttentionBackend):
         # only hit by the direct callers. Chain layout only (topk <= 1), so
         # accept_lens == last_correct_step_indices + 1.
         mamba_pool = req_pool.mamba_pool
-        if (
-            getattr(mamba_pool, "replayssm_spec_fold", False)
-            and not getattr(mamba_pool, "replayssm_is_kda", False)
+        if getattr(mamba_pool, "replayssm_spec_fold", False) and not getattr(
+            mamba_pool, "replayssm_is_kda", False
         ):
             from sglang.kernels.ops.attention.fla.gdn_replayssm_spec_fold import (
                 commit_gdn_replayssm_fold_after_verify,
@@ -1273,10 +1272,9 @@ class HybridLinearAttnBackend(AttentionBackend):
             )
             return
 
-        if (
-            getattr(mamba_pool, "replayssm_cache_base", None) is not None
-            and not getattr(mamba_pool, "replayssm_is_kda", False)
-        ):
+        if getattr(
+            mamba_pool, "replayssm_cache_base", None
+        ) is not None and not getattr(mamba_pool, "replayssm_is_kda", False):
             from sglang.kernels.ops.attention.fla.gdn_replayssm_spec_decode import (
                 commit_gdn_replayssm_spec,
             )
@@ -1293,13 +1291,58 @@ class HybridLinearAttnBackend(AttentionBackend):
                 max_cache_len=mamba_caches.replayssm_d.shape[-2],
                 max_spec_len=mamba_caches.intermediate_conv_window[0].shape[2],
                 null_block_id=-1,
+                proposal_to_history=(
+                    (
+                        (mamba_caches.replayssm_proposal_d, mamba_caches.replayssm_d),
+                        (mamba_caches.replayssm_proposal_k, mamba_caches.replayssm_k),
+                        (mamba_caches.replayssm_proposal_g, mamba_caches.replayssm_g),
+                        (
+                            mamba_caches.replayssm_proposal_rawv,
+                            mamba_caches.replayssm_rawv,
+                        ),
+                        (
+                            mamba_caches.replayssm_proposal_rawk,
+                            mamba_caches.replayssm_rawk,
+                        ),
+                        (
+                            mamba_caches.replayssm_proposal_beta,
+                            mamba_caches.replayssm_beta,
+                        ),
+                    )
+                    if getattr(mamba_pool, "replayssm_spec_split", False)
+                    else ()
+                ),
+                checkpoint_indices=mamba_pool.replayssm_checkpoint_index,
+                split_compaction=(
+                    (
+                        mamba_caches.temporal,
+                        mamba_caches.replayssm_rawv,
+                        mamba_caches.replayssm_rawk,
+                        mamba_caches.replayssm_g,
+                        mamba_caches.replayssm_beta,
+                    )
+                    if getattr(mamba_pool, "replayssm_spec_split", False)
+                    else None
+                ),
+                mamba_track_indices=mamba_track_indices,
+                mamba_steps_to_track=mamba_steps_to_track,
             )
-            fused_conv_window_scatter_with_mask(
-                mamba_caches.conv[0],
-                mamba_caches.intermediate_conv_window[0],
-                state_indices_tensor,
-                last_correct_step_indices,
-            )
+            for conv, intermediate in zip(
+                mamba_caches.conv, mamba_caches.intermediate_conv_window
+            ):
+                fused_conv_window_scatter_with_mask(
+                    conv,
+                    intermediate,
+                    state_indices_tensor,
+                    last_correct_step_indices,
+                )
+                if mamba_track_indices is not None:
+                    fused_conv_window_scatter_with_mask(
+                        conv,
+                        intermediate,
+                        mamba_track_indices,
+                        mamba_steps_to_track,
+                    )
             return
 
         if getattr(mamba_pool, "replayssm_is_kda", False):

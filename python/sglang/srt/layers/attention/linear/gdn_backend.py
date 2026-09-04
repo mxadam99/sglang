@@ -559,6 +559,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
         retrieve_parent_token = forward_metadata.retrieve_parent_token
 
         mamba_cache_params = self.req_to_token_pool.mamba2_layer_cache(layer.layer_id)
+        mamba_pool = self.req_to_token_pool.mamba_pool
         conv_states = mamba_cache_params.conv[0]
         ssm_states = mamba_cache_params.temporal
         if is_target_verify:
@@ -585,11 +586,21 @@ class GDNAttnBackend(MambaAttnBackendBase):
         needs_state_gather = (
             (not is_target_verify)
             and (not is_cpu())
-            and (not conv_states.is_contiguous() or not ssm_states.is_contiguous())
+            and (
+                not conv_states.is_contiguous()
+                or not ssm_states.is_contiguous()
+                or getattr(mamba_pool, "replayssm_checkpoint_index", None) is not None
+            )
         )
         if needs_state_gather:
             conv_states_contig = conv_states[cache_indices].contiguous()
-            ssm_states_contig = ssm_states[cache_indices].contiguous()
+            checkpoint_indices = getattr(mamba_pool, "replayssm_checkpoint_index", None)
+            ssm_source_indices = (
+                checkpoint_indices[cache_indices]
+                if checkpoint_indices is not None
+                else cache_indices
+            )
+            ssm_states_contig = ssm_states[ssm_source_indices].contiguous()
             state_cache_indices = torch.arange(
                 cache_indices.shape[0],
                 device=cache_indices.device,
@@ -668,7 +679,6 @@ class GDNAttnBackend(MambaAttnBackendBase):
             # ReplaySSM verify protocols: fold-every-commit (ring-write during
             # verify, fold on commit), circular ring, or the snapshotting
             # fallback when neither ring is allocated.
-            mamba_pool = self.req_to_token_pool.mamba_pool
             use_replayssm_fold = (
                 mamba_cache_params.replayssm_rawv is not None
                 and getattr(mamba_pool, "replayssm_spec_fold", False)
@@ -934,6 +944,13 @@ class GDNAttnBackend(MambaAttnBackendBase):
             is_flush=mamba_pool.replayssm_is_flush,
             max_cache_len=max_cache_len,
             max_spec_len=draft_token_num,
+            proposal_d=layer_cache.replayssm_proposal_d,
+            proposal_k=layer_cache.replayssm_proposal_k,
+            proposal_g=layer_cache.replayssm_proposal_g,
+            proposal_rawv=layer_cache.replayssm_proposal_rawv,
+            proposal_rawk=layer_cache.replayssm_proposal_rawk,
+            proposal_beta=layer_cache.replayssm_proposal_beta,
+            checkpoint_indices=mamba_pool.replayssm_checkpoint_index,
             scale=K**-0.5,
             use_qk_l2norm_in_kernel=True,
             # SGLang marks invalid/padding requests with a negative mamba slot
