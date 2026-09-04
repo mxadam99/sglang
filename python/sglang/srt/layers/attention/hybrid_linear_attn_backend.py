@@ -1276,56 +1276,47 @@ class HybridLinearAttnBackend(AttentionBackend):
             mamba_pool, "replayssm_cache_base", None
         ) is not None and not getattr(mamba_pool, "replayssm_is_kda", False):
             from sglang.kernels.ops.attention.fla.gdn_replayssm_spec_decode import (
+                commit_gdn_replayssm_circular,
                 commit_gdn_replayssm_spec,
             )
             from sglang.kernels.ops.mamba.mamba_state_scatter_triton import (
                 fused_conv_window_scatter_with_mask,
             )
 
+            if req_pool_indices is None:
+                raise RuntimeError(
+                    "ReplaySSM commit requires request-pool indices for its "
+                    "request-indexed circular history."
+                )
+            replay_indices = req_pool_indices[:request_number]
+            accept_lens = last_correct_step_indices + 1
             commit_gdn_replayssm_spec(
-                write_pos=mamba_pool.replayssm_write_pos,
+                write_pos=mamba_pool.replayssm_spec_write_pos,
                 cache_base=mamba_pool.replayssm_cache_base,
                 is_flush=mamba_pool.replayssm_is_flush,
-                num_accepted=last_correct_step_indices + 1,
-                state_batch_indices=state_indices_tensor,
+                num_accepted=accept_lens,
+                replay_indices=replay_indices,
                 max_cache_len=mamba_caches.replayssm_d.shape[-2],
                 max_spec_len=mamba_caches.intermediate_conv_window[0].shape[2],
+                fold_every_commit=mamba_caches.temporal.dtype != torch.float32,
                 null_block_id=-1,
-                proposal_to_history=(
-                    (
-                        (mamba_caches.replayssm_proposal_d, mamba_caches.replayssm_d),
-                        (mamba_caches.replayssm_proposal_k, mamba_caches.replayssm_k),
-                        (mamba_caches.replayssm_proposal_g, mamba_caches.replayssm_g),
-                        (
-                            mamba_caches.replayssm_proposal_rawv,
-                            mamba_caches.replayssm_rawv,
-                        ),
-                        (
-                            mamba_caches.replayssm_proposal_rawk,
-                            mamba_caches.replayssm_rawk,
-                        ),
-                        (
-                            mamba_caches.replayssm_proposal_beta,
-                            mamba_caches.replayssm_beta,
-                        ),
-                    )
-                    if getattr(mamba_pool, "replayssm_spec_split", False)
-                    else ()
-                ),
-                checkpoint_indices=mamba_pool.replayssm_checkpoint_index,
-                split_compaction=(
-                    (
-                        mamba_caches.temporal,
-                        mamba_caches.replayssm_rawv,
-                        mamba_caches.replayssm_rawk,
-                        mamba_caches.replayssm_g,
-                        mamba_caches.replayssm_beta,
-                    )
-                    if getattr(mamba_pool, "replayssm_spec_split", False)
-                    else None
-                ),
+            )
+            commit_gdn_replayssm_circular(
+                checkpoint_state=mamba_caches.temporal,
+                d_cache=mamba_caches.replayssm_d,
+                k_cache=mamba_caches.replayssm_k,
+                g_cache=mamba_caches.replayssm_g,
+                d_residual_cache=mamba_caches.replayssm_rawv,
+                k_residual_cache=mamba_caches.replayssm_rawk,
+                state_batch_indices=state_indices_tensor,
+                replay_indices=replay_indices,
+                write_pos=mamba_pool.replayssm_spec_write_pos,
+                cache_base=mamba_pool.replayssm_cache_base,
+                is_flush=mamba_pool.replayssm_is_flush,
+                accept_lens=accept_lens,
                 mamba_track_indices=mamba_track_indices,
                 mamba_steps_to_track=mamba_steps_to_track,
+                null_block_id=-1,
             )
             for conv, intermediate in zip(
                 mamba_caches.conv, mamba_caches.intermediate_conv_window

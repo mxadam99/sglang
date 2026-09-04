@@ -7004,13 +7004,14 @@ class ServerArgs:
                 ) or verify not in (
                     "triton",
                     "nv_cutedsl",
+                    "flashinfer",
                 ):
                     raise ValueError(
                         "--enable-linear-replayssm-spec with "
                         f"SGLANG_RAGGED_VERIFY_MODE={ragged_mode.value} requires the "
                         "KDA fold-every-commit family (DSPARK/DFLASH/DFLASH_CONFIDENCE) and a "
-                        "ring-writing verify kernel (--linear-attn-verify-backend "
-                        "triton or nv_cutedsl); got "
+                        "ring-writing ReplaySSM verify route (configured backend "
+                        "triton, nv_cutedsl, or flashinfer); got "
                         f"algorithm={cfg.speculative_algorithm!r}, "
                         f"verify={verify!r}. Use SGLANG_RAGGED_VERIFY_MODE=static."
                     )

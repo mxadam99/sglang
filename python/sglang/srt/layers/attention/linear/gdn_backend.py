@@ -1093,22 +1093,12 @@ class GDNAttnBackend(MambaAttnBackendBase):
             is_flush=mamba_pool.replayssm_is_flush,
             max_cache_len=max_cache_len,
             max_spec_len=draft_token_num,
-            proposal_d=layer_cache.replayssm_proposal_d,
-            proposal_k=layer_cache.replayssm_proposal_k,
-            proposal_g=layer_cache.replayssm_proposal_g,
-            proposal_rawv=layer_cache.replayssm_proposal_rawv,
-            proposal_rawk=layer_cache.replayssm_proposal_rawk,
-            proposal_beta=layer_cache.replayssm_proposal_beta,
-            checkpoint_indices=mamba_pool.replayssm_checkpoint_index,
             scale=K**-0.5,
             use_qk_l2norm_in_kernel=True,
             # SGLang marks invalid/padding requests with a negative mamba slot
             # index (valid slots start at 0), so the kernel's "null block"
             # sentinel is -1, not the vLLM default of 0.
             null_block_id=-1,
-            # Capacity folds are committed once across every GDN layer after
-            # acceptance; the active path is therefore a single launch/layer.
-            launch_mode="verify",
         )
         # Match the recurrent target_verify output shape (== value.shape).
         return out.reshape(value.shape)

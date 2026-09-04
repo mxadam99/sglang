@@ -1216,11 +1216,7 @@ class DFlashWorkerV2(BaseSpecWorker):
 
         table_width = int(req_to_token.shape[1])
         if table_width <= 0:
-            if bool(mask.any().item()):
-                raise RuntimeError(
-                    f"{context} req_to_token table is empty but gather mask is non-empty."
-                )
-            return torch.empty((0,), dtype=torch.int64, device=self.device)
+            raise RuntimeError(f"{context} req_to_token table is empty.")
 
         # Only the masked-off rectangular padding can be out of range in the normal
         # ragged-batch case. Replace those don't-care columns with a valid in-range
@@ -1235,11 +1231,11 @@ class DFlashWorkerV2(BaseSpecWorker):
         req_pool_indices: torch.Tensor,
         start: torch.Tensor | None,
         lengths: torch.Tensor,
+        max_len: int,
     ) -> torch.Tensor:
         lengths = lengths.to(torch.int64)
         if lengths.numel() == 0:
             return torch.empty((0,), dtype=torch.int64, device=self.device)
-        max_len = int(lengths.max().item())
         if max_len <= 0:
             return torch.empty((0,), dtype=torch.int64, device=self.device)
 
@@ -1346,6 +1342,8 @@ class DFlashWorkerV2(BaseSpecWorker):
                 req_pool_indices=req_pool_indices,
                 start=suffix_start,
                 lengths=draft_prefix_lens,
+                max_len=int(self.draft_window_size)
+                + (self.page_size if self.page_size > 1 else 0),
             )
             assign_req_to_token_pool_func(
                 req_pool_indices,
