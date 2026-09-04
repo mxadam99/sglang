@@ -2203,6 +2203,11 @@ class ServerArgs:
         "The draft retains its configured block size. Defaults to the full block.",
         NS("spec"),
     ] = None
+    speculative_dflash_overlap_mamba_commit: A[
+        bool,
+        "DFLASH only. Commit accepted hybrid-GDN state on a dedicated CUDA stream and overlap it with the next draft proposal.",
+        NS("spec"),
+    ] = False
     speculative_dspark_block_size: A[
         Optional[int],
         "DSPARK only. Draft block size gamma (number of proposed draft tokens). The verify window is gamma + 1, so this sets --speculative-num-draft-tokens = gamma + 1. Omit to auto-infer gamma from the draft checkpoint block_size.",

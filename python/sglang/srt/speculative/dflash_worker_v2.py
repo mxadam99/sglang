@@ -313,6 +313,15 @@ class DFlashWorkerV2(BaseSpecWorker):
         self.draft_window_size: Optional[int] = get_spec().speculative_draft_window_size
         self.use_compact_draft_cache = self.draft_window_size is not None
         self.device = target_worker.device
+        self._overlap_mamba_commit = bool(
+            get_spec().speculative_dflash_overlap_mamba_commit and is_cuda()
+        )
+        self._mamba_commit_stream = (
+            torch.cuda.Stream(device=self.device)
+            if self._overlap_mamba_commit
+            else None
+        )
+        self._mamba_commit_done: Optional[torch.cuda.Event] = None
 
         self._warned_sampling_fallback = False
         self._draft_probs_buf = None
@@ -1721,6 +1730,47 @@ class DFlashWorkerV2(BaseSpecWorker):
                 req_pool_indices=batch.req_pool_indices[: commit_lens.shape[0]],
             )
 
+    def _wait_for_mamba_commit(self) -> None:
+        if self._mamba_commit_done is None:
+            return
+        torch.cuda.current_stream(self.device).wait_event(self._mamba_commit_done)
+        self._mamba_commit_done = None
+
+    def _commit_target_mamba_state(
+        self,
+        *,
+        batch: ScheduleBatch,
+        seq_lens_pre_verify: torch.Tensor,
+        commit_lens: torch.Tensor,
+    ) -> None:
+        if not self._overlap_mamba_commit:
+            self._update_target_mamba_state_after_verify(
+                batch=batch,
+                seq_lens_pre_verify=seq_lens_pre_verify,
+                commit_lens=commit_lens,
+            )
+            return
+
+        assert self._mamba_commit_stream is not None
+        producer = torch.cuda.current_stream(self.device)
+        ready = torch.cuda.Event()
+        ready.record(producer)
+        self._mamba_commit_stream.wait_event(ready)
+        commit_lens.record_stream(self._mamba_commit_stream)
+        seq_lens_pre_verify.record_stream(self._mamba_commit_stream)
+        batch.req_pool_indices.record_stream(self._mamba_commit_stream)
+        if batch.mamba_track_indices is not None:
+            batch.mamba_track_indices.record_stream(self._mamba_commit_stream)
+        with torch.cuda.stream(self._mamba_commit_stream):
+            self._update_target_mamba_state_after_verify(
+                batch=batch,
+                seq_lens_pre_verify=seq_lens_pre_verify,
+                commit_lens=commit_lens,
+            )
+            done = torch.cuda.Event()
+            done.record(self._mamba_commit_stream)
+        self._mamba_commit_done = done
+
     def _ensure_accept_bonus_buffers(self, bs: int) -> None:
         if self._accept_bonus_buffer_cap >= int(bs):
             return
@@ -1834,6 +1884,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._validate_phase1_sampling_support(batch)
 
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
+            self._wait_for_mamba_commit()
             # Target prefill: capture DFlash aux hidden states for prompt tokens.
             batch_output = self.target_worker.forward_batch_generation(
                 batch, capture_hidden_mode=CaptureHiddenMode.FULL
@@ -2178,6 +2229,9 @@ class DFlashWorkerV2(BaseSpecWorker):
         batch.seq_lens_cpu = seq_lens_cpu_backup
         batch.seq_lens_sum = seq_lens_sum_backup
 
+        # The next proposal is complete. Synchronize the previous round's
+        # accepted-state fold only now, immediately before target state is read.
+        self._wait_for_mamba_commit()
         target_out = self.target_worker.forward_batch_generation(
             batch=None,
             forward_batch=verify_forward_batch,
@@ -2314,7 +2368,7 @@ class DFlashWorkerV2(BaseSpecWorker):
 
         if self._need_mamba_verify_commit:
             assert seq_lens_pre_verify is not None
-            self._update_target_mamba_state_after_verify(
+            self._commit_target_mamba_state(
                 batch=batch,
                 seq_lens_pre_verify=seq_lens_pre_verify,
                 commit_lens=commit_lens,
