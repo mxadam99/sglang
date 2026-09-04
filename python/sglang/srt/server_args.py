@@ -328,6 +328,8 @@ FP8_GEMM_RUNNER_BACKEND_CHOICES = [
 
 FP4_GEMM_RUNNER_BACKEND_CHOICES = [
     "auto",
+    "flashinfer_auto",
+    "flashinfer_b12x",
     "flashinfer_cudnn",
     "flashinfer_cutedsl",
     "flashinfer_cutlass",
@@ -2192,7 +2194,13 @@ class ServerArgs:
     ] = None
     speculative_dflash_block_size: A[
         Optional[int],
-        "DFLASH only. Block size (verify window length). Alias of --speculative-num-draft-tokens for DFLASH.",
+        "DFLASH only. Draft block size. Alias of --speculative-num-draft-tokens for DFLASH.",
+        NS("spec"),
+    ] = None
+    speculative_dflash_verify_budget: A[
+        Optional[int],
+        "DFLASH only. Number of draft tokens verified by the target per decode step. "
+        "The draft retains its configured block size. Defaults to the full block.",
         NS("spec"),
     ] = None
     speculative_dspark_block_size: A[
@@ -2728,6 +2736,12 @@ class ServerArgs:
         ),
         NS("exec.mamba"),
     ] = None
+    enable_sm120_flashinfer_gdn_verify: A[
+        bool,
+        "Experimentally enable the FlashInfer GDN target-verify kernel on SM120. "
+        "Requires --linear-attn-verify-backend flashinfer and bfloat16 Mamba state.",
+        NS("exec.mamba"),
+    ] = False
     # ReplaySSM buffered output-only linear-attn decode (GDN + KDA): per-slot
     # ring + periodic flush to cut per-step HBM state traffic.
     enable_linear_replayssm: A[

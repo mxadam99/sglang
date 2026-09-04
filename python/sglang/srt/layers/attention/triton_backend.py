@@ -573,6 +573,7 @@ class TritonAttnBackend(AttentionBackend):
             custom_mask = None
         seq_mask_len = num_draft_tokens * (seq_lens + num_draft_tokens)
         mask_indptr = self.mask_indptr[: bs + 1]
+        mask_indptr[0] = 0
         mask_indptr[1 : bs + 1] = torch.cumsum(seq_mask_len, dim=0)
         return (
             qo_indptr,
@@ -916,6 +917,7 @@ class TritonAttnBackend(AttentionBackend):
                 forward_batch.seq_lens + num_draft_tokens
             )
             mask_indptr = self.mask_indptr
+            mask_indptr[0] = 0
             mask_indptr[1 : bs + 1] = torch.cumsum(seq_mask_len[:bs], dim=0)
             mask_indptr = mask_indptr[: bs + 1]
             max_extend_len = num_draft_tokens

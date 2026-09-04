@@ -93,6 +93,8 @@ class Fp4GemmRunnerBackend(Enum):
 
     AUTO = "auto"
     FLASHINFER_CUDNN = "flashinfer_cudnn"
+    FLASHINFER_AUTO = "flashinfer_auto"
+    FLASHINFER_B12X = "flashinfer_b12x"
     FLASHINFER_CUTEDSL = "flashinfer_cutedsl"
     FLASHINFER_CUTLASS = "flashinfer_cutlass"
     FLASHINFER_TRTLLM = "flashinfer_trtllm"
@@ -131,6 +133,10 @@ class Fp4GemmRunnerBackend(Enum):
         """
         if self == Fp4GemmRunnerBackend.FLASHINFER_CUTEDSL:
             return "cute-dsl"
+        if self == Fp4GemmRunnerBackend.FLASHINFER_AUTO:
+            return "auto"
+        if self == Fp4GemmRunnerBackend.FLASHINFER_B12X:
+            return "b12x"
         if self.value.startswith("flashinfer_"):
             return self.value.removeprefix("flashinfer_")
         else:

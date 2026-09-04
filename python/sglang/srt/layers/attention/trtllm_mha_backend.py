@@ -181,8 +181,16 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         self.topk = get_spec().speculative_eagle_topk or 0
         self.speculative_step_id = speculative_step_id
         self.target_verify_metadata = {}
+        # XQA requires an explicit packed mask when a decode invocation carries
+        # more than one query token per request.  DFlash verification is a
+        # linear causal chain, so cache one graph-stable mask per batch shape.
+        self._xqa_causal_mask_cache: dict[tuple[int, int], torch.Tensor] = {}
 
         self.speculative_num_draft_tokens = get_spec().speculative_num_draft_tokens
+        self.target_verify_num_tokens = (
+            get_spec().speculative_dflash_verify_budget
+            or self.speculative_num_draft_tokens
+        )
         # True iff the model declares ENCODER_ONLY (bidirectional) layers, which
         # need the expanded TARGET_VERIFY metadata (TRTLLMMHAMetadata.encoder_*).
         self.expand_encoder_only_verify = any(
@@ -512,8 +520,8 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 # mode is fixed for the whole server run, so the two never mix.
                 "cu_seqlens_q": torch.arange(
                     0,
-                    max_bs * self.speculative_num_draft_tokens + 1,
-                    step=self.speculative_num_draft_tokens,
+                    max_bs * self.target_verify_num_tokens + 1,
+                    step=self.target_verify_num_tokens,
                     dtype=torch.int32,
                     device=self.device,
                 ),
@@ -529,7 +537,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 "swa_page_table": self._alloc_swa_page_table(max_bs, max_num_pages),
             }
             if self.expand_encoder_only_verify:
-                max_verify_rows = max_bs * self.speculative_num_draft_tokens
+                max_verify_rows = max_bs * self.target_verify_num_tokens
                 self.target_verify_metadata["encoder_cache_seqlens"] = torch.zeros(
                     max_verify_rows, dtype=torch.int32, device=self.device
                 )
@@ -630,7 +638,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 spec_info is not None and spec_info.ragged_verify_layout is not None
             )
             metadata.max_seq_len_q = (
-                self.speculative_num_draft_tokens
+                self.target_verify_num_tokens
                 if metadata.is_ragged_verify
                 else num_tokens // bs
             )
@@ -988,7 +996,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 metadata.max_seq_len_q = (
                     geometry.max_seq_len_q
                     if geometry.max_seq_len_q is not None
-                    else self.speculative_num_draft_tokens
+                    else self.target_verify_num_tokens
                 )
                 metadata.cu_seqlens_q = geometry.cu_seqlens_q
                 metadata.cu_seqlens_k = geometry.cu_seqlens_k
@@ -1106,10 +1114,35 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
     ) -> torch.Tensor:
         """Run decode, optionally sorting and splitting requests by KV length."""
 
+        def get_causal_mask(batch_size: int) -> torch.Tensor:
+            cache_key = (batch_size, q_len_per_req)
+            mask = self._xqa_causal_mask_cache.get(cache_key)
+            if mask is not None:
+                return mask
+
+            words_per_row = (q_len_per_req + 31) // 32 * 2
+            rows = []
+            for query_index in range(q_len_per_req):
+                allowed_tokens = query_index + 1
+                row = []
+                for word_index in range(words_per_row):
+                    bits = min(max(allowed_tokens - word_index * 16, 0), 16)
+                    row.append((1 << bits) - 1)
+                rows.append(row)
+            mask = (
+                torch.tensor(rows, dtype=torch.uint16, device=query.device)
+                .unsqueeze(0)
+                .expand(batch_size, -1, -1)
+                .contiguous()
+            )
+            self._xqa_causal_mask_cache[cache_key] = mask
+            return mask
+
         def run_group(group_query, group_block_tables, group_seq_lens):
             kwargs = {}
             if q_len_per_req != 1:
                 kwargs["q_len_per_req"] = q_len_per_req
+                kwargs["mask"] = get_causal_mask(group_seq_lens.shape[0])
             return flashinfer.decode.trtllm_batch_decode_with_kv_cache(
                 query=group_query,
                 kv_cache=kv_cache,

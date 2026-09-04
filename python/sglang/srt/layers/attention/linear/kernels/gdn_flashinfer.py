@@ -20,6 +20,7 @@ from sglang.srt.layers.attention.linear.kernels.kernel_backend import (
     LinearAttnKernelBase,
 )
 from sglang.srt.runtime_context import (
+    get_exec,
     mamba_cache_chunk_size,
 )
 from sglang.srt.utils import is_cuda
@@ -166,7 +167,10 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
         # The SM120 chunked-prefill kernel only accepts float32 initial
         # states; SM100 accepts the state-pool dtype directly.
         self._prefill_needs_fp32_state = sm_major >= 12
-        self.supports_target_verify = sm_major in (9, 10)
+        self.supports_target_verify = sm_major in (9, 10) or (
+            sm_major == 12
+            and get_exec().mamba.enable_sm120_flashinfer_gdn_verify
+        )
 
         if sm_major == 9 and self._prefill_fn is None:
             raise RuntimeError("FlashInfer GDN prefill kernel is unavailable.")

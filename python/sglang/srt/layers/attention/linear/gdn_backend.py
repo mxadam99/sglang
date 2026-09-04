@@ -135,6 +135,7 @@ class GDNKernelDispatcher:
         self.tree_verify_kernel = triton_kernel
 
         cutedsl_kernel = None
+        flashinfer_kernel = None
         if decode_backend.is_triton():
             self.decode_kernel = triton_kernel
         elif decode_backend.is_intel_xpu():
@@ -226,6 +227,21 @@ class GDNKernelDispatcher:
         if verify_backend is not None and verify_backend.is_triton():
             self.verify_kernel = triton_kernel
             self.verify_kernel_is_flashinfer = False
+        elif verify_backend is not None and verify_backend.is_flashinfer():
+            if flashinfer_kernel is None:
+                from sglang.srt.layers.attention.linear.kernels.gdn_flashinfer import (
+                    FlashInferGDNKernel,
+                )
+
+                flashinfer_kernel = FlashInferGDNKernel()
+            if not flashinfer_kernel.supports_target_verify:
+                raise ValueError(
+                    "FlashInfer GDN target-verify is unsupported on this GPU. "
+                    "On SM120, explicitly pass "
+                    "--enable-sm120-flashinfer-gdn-verify to opt in."
+                )
+            self.verify_kernel = flashinfer_kernel
+            self.verify_kernel_is_flashinfer = True
         elif (
             decode_backend.is_flashinfer() or prefill_backend.is_flashinfer()
         ) and flashinfer_kernel.supports_target_verify:

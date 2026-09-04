@@ -17,6 +17,46 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _resolve_dflash_verify_budget(
+    server_args: ServerArgs, draft_block_size: int
+) -> int:
+    verify_budget = server_args.speculative_dflash_verify_budget
+    if verify_budget is None:
+        return draft_block_size
+
+    verify_budget = int(verify_budget)
+    if verify_budget <= 0 or verify_budget > draft_block_size:
+        raise ValueError(
+            "DFLASH requires --speculative-dflash-verify-budget to be in "
+            f"[1, {draft_block_size}], got {verify_budget}."
+        )
+
+    if verify_budget < draft_block_size:
+        from sglang.srt.arg_groups.overrides import (
+            attention_backends_of,
+            resolved_view,
+        )
+
+        prefill_backend, decode_backend = attention_backends_of(
+            resolved_view(server_args)
+        )
+        speculative_attention_mode = server_args.speculative_attention_mode
+        target_verify_backend = (
+            decode_backend
+            if speculative_attention_mode == "decode"
+            else prefill_backend
+        )
+        if target_verify_backend not in ("triton", "trtllm_mha"):
+            raise ValueError(
+                "Reduced DFLASH target verification requires Triton or "
+                "TRTLLM-MHA/XQA attention; "
+                f"speculative_attention_mode={speculative_attention_mode!r}, "
+                f"selected_backend={target_verify_backend!r}."
+            )
+
+    return verify_budget
+
+
 def _disable_overlap_schedule_for_cpu(server_args: ServerArgs) -> None:
     cfg = resolving_view(server_args)
     if cfg.device != "cpu" or cfg.disable_overlap_schedule:
@@ -303,6 +343,13 @@ def _handle_dflash(server_args: ServerArgs) -> None:
             "_handle_dflash",
             speculative_num_draft_tokens=inferred_block_size,
         )
+
+    draft_block_size = int(
+        resolving_view(server_args).speculative_num_draft_tokens
+    )
+    server_args.speculative_dflash_verify_budget = _resolve_dflash_verify_budget(
+        server_args, draft_block_size
+    )
 
     if cfg.speculative_draft_window_size is not None:
         draft_tokens = int(cfg.speculative_num_draft_tokens)

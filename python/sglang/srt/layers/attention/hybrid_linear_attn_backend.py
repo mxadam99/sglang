@@ -1222,7 +1222,6 @@ class HybridLinearAttnBackend(AttentionBackend):
         slot ids instead of reusing this step's ``forward_metadata``; the scatter
         below reads the metadata it just planned.
         """
-        del req_pool_indices
         request_number = last_correct_step_indices.shape[0]
 
         # `mamba_track_indices` is VIRTUAL; the scatter writes physical views.
@@ -1231,13 +1230,20 @@ class HybridLinearAttnBackend(AttentionBackend):
                 mamba_track_indices
             )
 
-        state_indices_tensor = (
-            self.linear_attn_backend.forward_metadata.mamba_cache_indices[
-                :request_number
-            ]
-        )
-
         req_pool = self.linear_attn_backend.req_to_token_pool
+        if req_pool_indices is None:
+            state_indices_tensor = (
+                self.linear_attn_backend.forward_metadata.mamba_cache_indices[
+                    :request_number
+                ]
+            )
+        else:
+            state_indices_tensor = req_pool.get_mamba_indices(
+                req_pool_indices[:request_number]
+            )
+            state_indices_tensor = self.linear_attn_backend._translate_mamba_indices(
+                state_indices_tensor
+            )
         mamba_caches = req_pool.get_speculative_mamba2_params_all_layers()
 
         # ReplaySSM-KDA: the accepted drafts live in the per-slot ring (written
@@ -1248,6 +1254,25 @@ class HybridLinearAttnBackend(AttentionBackend):
         # only hit by the direct callers. Chain layout only (topk <= 1), so
         # accept_lens == last_correct_step_indices + 1.
         mamba_pool = req_pool.mamba_pool
+        if (
+            getattr(mamba_pool, "replayssm_spec_fold", False)
+            and not getattr(mamba_pool, "replayssm_is_kda", False)
+        ):
+            from sglang.kernels.ops.attention.fla.gdn_replayssm_spec_fold import (
+                commit_gdn_replayssm_fold_after_verify,
+            )
+
+            commit_gdn_replayssm_fold_after_verify(
+                spec_state=mamba_caches,
+                state_batch_indices=state_indices_tensor,
+                accept_lens=last_correct_step_indices + 1,
+                last_correct_step_indices=last_correct_step_indices,
+                mamba_track_indices=mamba_track_indices,
+                mamba_steps_to_track=mamba_steps_to_track,
+                null_block_id=-1,
+            )
+            return
+
         if getattr(mamba_pool, "replayssm_is_kda", False):
             from sglang.kernels.ops.attention.fla.kda_replayssm_spec_decode import (
                 commit_kda_replayssm_after_verify,
