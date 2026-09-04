@@ -869,12 +869,12 @@ class KVCacheConfigurator:
         _algo = (get_spec().speculative_algorithm or "").upper()
         if (
             get_exec().mamba.enable_linear_replayssm_spec
-            and _algo in ("DSPARK", "DFLASH")
+            and _algo in ("DSPARK", "DFLASH", "DFLASH_CONFIDENCE")
             and self.hybrid_gdn_config is None
             and kimi_linear_config(self.model_config) is None
         ):
             raise ValueError(
-                "--enable-linear-replayssm-spec with DSPARK/DFLASH requires a GDN "
+                "--enable-linear-replayssm-spec with DSPARK/DFLASH/DFLASH_CONFIDENCE requires a GDN "
                 "or KDA (kimi_linear) model; got another Mamba-style model."
             )
         req_to_token_pool = HybridReqToTokenPool(
