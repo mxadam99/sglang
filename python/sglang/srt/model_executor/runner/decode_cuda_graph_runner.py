@@ -218,6 +218,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         attn_backend=None,
         speculative_num_steps: Optional[int] = None,
         speculative_num_draft_tokens: Optional[int] = None,
+        capture_bs: Optional[list[int]] = None,
     ):
         super().__init__(model_runner)
 
@@ -335,6 +336,15 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         self.capture_bs, self.compile_bs = get_batch_sizes_to_capture(
             model_runner, self.captured_req_width
         )
+        if capture_bs is not None:
+            requested = set(capture_bs)
+            self.capture_bs = [bs for bs in self.capture_bs if bs in requested]
+            self.compile_bs = [bs for bs in self.compile_bs if bs in requested]
+            if not self.capture_bs:
+                raise ValueError(
+                    "adaptive speculative graph tier has no batch sizes after "
+                    f"product-bound pruning: requested={sorted(requested)}"
+                )
         if KTRANSFORMERS_AVAILABLE:
             KTMoEWrapper.set_capture_batch_sizes(self.capture_bs)
 

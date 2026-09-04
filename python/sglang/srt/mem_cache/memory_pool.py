@@ -517,6 +517,7 @@ class MambaPool:
         linear_replayssm_cache_len: int = 16,
         envelope_layout: bool = False,
         enable_linear_replayssm_spec: bool = False,
+        linear_replayssm_spec_mode: str = "eager_fold",
     ):
         conv_state_shape = cache_params.shape.conv
         temporal_state_shape = cache_params.shape.temporal
@@ -540,7 +541,11 @@ class MambaPool:
         # no cursors (KDA additionally keeps d/k, see the allocation below).
         # The shared g allocation gates on `_replayssm_on`.
         self.enable_linear_replayssm_spec = enable_linear_replayssm_spec
-        self.replayssm_spec_fold = bool(enable_linear_replayssm_spec)
+        self.linear_replayssm_spec_mode = linear_replayssm_spec_mode
+        self.replayssm_spec_fold = bool(
+            enable_linear_replayssm_spec
+            and linear_replayssm_spec_mode == "eager_fold"
+        )
         _replayssm_on = enable_linear_replayssm or enable_linear_replayssm_spec
 
         # for disagg with nvlink
@@ -1222,6 +1227,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
         linear_replayssm_cache_len: int = 16,
         mamba_envelope_layout: bool = False,
         enable_linear_replayssm_spec: bool = False,
+        linear_replayssm_spec_mode: str = "eager_fold",
     ):
         super().__init__(
             size=size,
@@ -1249,6 +1255,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
             linear_replayssm_cache_len=linear_replayssm_cache_len,
             mamba_envelope_layout=mamba_envelope_layout,
             enable_linear_replayssm_spec=enable_linear_replayssm_spec,
+            linear_replayssm_spec_mode=linear_replayssm_spec_mode,
         )
 
     def _init_mamba_pool(
@@ -1265,6 +1272,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
         linear_replayssm_cache_len: int = 16,
         mamba_envelope_layout: bool = False,
         enable_linear_replayssm_spec: bool = False,
+        linear_replayssm_spec_mode: str = "eager_fold",
     ):
         self.mamba_pool = self.mamba_pool_cls(
             size=mamba_size,
@@ -1279,6 +1287,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
             linear_replayssm_cache_len=linear_replayssm_cache_len,
             envelope_layout=mamba_envelope_layout,
             enable_linear_replayssm_spec=enable_linear_replayssm_spec,
+            linear_replayssm_spec_mode=linear_replayssm_spec_mode,
         )
         self.mamba_allocator = MambaSlotAllocator(
             size=mamba_size,

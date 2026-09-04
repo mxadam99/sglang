@@ -1,5 +1,6 @@
 import logging
 import math
+import time
 from dataclasses import replace
 from typing import List, Optional, Tuple
 
@@ -26,7 +27,11 @@ from sglang.srt.lora.layers import unwrap_lora_layer
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
-from sglang.srt.model_executor.cuda_graph_config import Backend
+from sglang.srt.model_executor.cuda_graph_config import (
+    Backend,
+    Phase,
+    check_cuda_graph_backend,
+)
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
@@ -41,6 +46,10 @@ from sglang.srt.runtime_context import (
 )
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
+from sglang.srt.speculative.adaptive_runtime_state import (
+    AdaptiveController,
+    SpecRuntimeState,
+)
 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 from sglang.srt.speculative.dflash_utils import (
@@ -70,7 +79,13 @@ from sglang.srt.speculative.spec_utils import (
     assign_req_to_token_pool_func,
     build_grammar_vocab_mask,
 )
-from sglang.srt.utils import get_available_gpu_memory, is_cuda, is_hip, is_npu
+from sglang.srt.utils import (
+    get_available_gpu_memory,
+    is_cuda,
+    is_hip,
+    is_npu,
+    log_info_on_rank0,
+)
 
 _is_npu = is_npu()
 
@@ -336,10 +351,20 @@ class DFlashWorkerV2(BaseSpecWorker):
                     model_block_size,
                 )
         self.draft_model.set_block_size(self.block_size)
+        # Adaptive DFlash changes only the target verification prefix.  The
+        # draft remains at its trained block width.
+        self.dflash_block_size = self.block_size
+        self.speculative_num_steps = self.block_size - 1
         self.speculative_num_draft_tokens = int(self.block_size)
         self.verify_budget = int(
             get_spec().speculative_dflash_verify_budget or self.block_size
         )
+        self.adaptive_controller: Optional[AdaptiveController] = None
+        if get_spec().speculative_adaptive:
+            self.adaptive_controller = AdaptiveController(
+                self,
+                config_path=get_spec().speculative_adaptive_config,
+            )
 
         self._mask_token = draft_config.mask_token
         self._mask_token_id_override = draft_config.mask_token_id
@@ -492,6 +517,112 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._draft_worker.init_cuda_graphs(
             capture_decode_cuda_graph=capture_decode_cuda_graph
         )
+        if self.adaptive_controller is not None:
+            self.adaptive_controller.register(
+                SpecRuntimeState(
+                    speculative_num_steps=self.speculative_num_steps,
+                    speculative_num_draft_tokens=self.verify_budget,
+                    draft_attn_backend=self.draft_model_runner.attn_backend,
+                    cuda_graph_runner=None,
+                    target_attn_backend=self.target_worker.model_runner.attn_backend,
+                    target_graph_runner=self.target_worker.model_runner.decode_cuda_graph_runner,
+                    draft_extend_attn_backend=None,
+                    cuda_graph_runner_for_draft_extend=None,
+                ),
+                steps=self.verify_budget - 1,
+            )
+            self.adaptive_controller.init_states(
+                cuda_graph_bs=(
+                    None
+                    if check_cuda_graph_backend(Phase.DECODE, Backend.DISABLED)
+                    else get_exec().graph.cuda_graph_bs_decode
+                )
+            )
+
+    def build_adaptive_runtime_state(
+        self,
+        speculative_num_steps: int,
+        speculative_num_draft_tokens: int,
+        cuda_graph_bs: list[int] | None = None,
+    ) -> SpecRuntimeState:
+        """Capture one product-bounded target-verification runtime tier."""
+        if speculative_num_draft_tokens > self.block_size:
+            raise ValueError(
+                "DFlash target verification width cannot exceed its trained draft "
+                f"block: {speculative_num_draft_tokens} > {self.block_size}"
+            )
+
+        target_runner = self.target_worker.model_runner
+        target_attn_backend = target_runner._get_attention_backend(
+            init_new_workspace=True
+        )
+        target_graph_runner = None
+        tic = time.perf_counter()
+        before_mem = get_available_gpu_memory(self.device, self.gpu_id)
+        if not check_cuda_graph_backend(Phase.DECODE, Backend.DISABLED):
+            from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
+                DecodeCudaGraphRunner,
+            )
+
+            target_graph_runner = DecodeCudaGraphRunner(
+                target_runner,
+                attn_backend=target_attn_backend,
+                speculative_num_steps=speculative_num_steps,
+                speculative_num_draft_tokens=speculative_num_draft_tokens,
+                capture_bs=cuda_graph_bs,
+            )
+
+        after_mem = get_available_gpu_memory(self.device, self.gpu_id)
+        self._additional_graph_memory_usage["target_verify"] = (
+            self._additional_graph_memory_usage.get("target_verify", 0.0)
+            + before_mem
+            - after_mem
+        )
+        self._additional_graph_time_usage["target_verify"] = (
+            self._additional_graph_time_usage.get("target_verify", 0.0)
+            + time.perf_counter()
+            - tic
+        )
+        log_info_on_rank0(
+            logger,
+            "Built DFlash adaptive tier "
+            f"verify_width={speculative_num_draft_tokens}, bs={cuda_graph_bs}, "
+            f"mem={before_mem - after_mem:.2f}GB",
+        )
+        return SpecRuntimeState(
+            speculative_num_steps=speculative_num_steps,
+            speculative_num_draft_tokens=speculative_num_draft_tokens,
+            draft_attn_backend=self.draft_model_runner.attn_backend,
+            cuda_graph_runner=None,
+            target_attn_backend=target_attn_backend,
+            target_graph_runner=target_graph_runner,
+            draft_extend_attn_backend=None,
+            cuda_graph_runner_for_draft_extend=None,
+        )
+
+    def apply_runtime_state(self, state: SpecRuntimeState) -> None:
+        """Atomically select the target backend, graph family, and verify width."""
+        if self.verify_budget == state.speculative_num_draft_tokens:
+            return
+        self.speculative_num_steps = state.speculative_num_steps
+        self.verify_budget = state.speculative_num_draft_tokens
+        self.target_worker.model_runner.attn_backend = state.target_attn_backend
+        self.target_worker.model_runner.decode_cuda_graph_runner = (
+            state.target_graph_runner
+        )
+
+    def activate_step_by_batch(self, batch_size: int) -> None:
+        if self.adaptive_controller is not None:
+            self.adaptive_controller.activate_step_by_batch(batch_size)
+
+    def on_verify_complete_cpu(
+        self, num_correct_drafts_per_req: list[int], batch_size: int = 0
+    ) -> None:
+        if self.adaptive_controller is not None:
+            self.adaptive_controller.on_verify_complete(
+                num_correct_drafts_per_req,
+                batch_size=batch_size,
+            )
 
     def _maybe_build_draft_sampler(self):
         def _eager(reason):
@@ -679,7 +810,9 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._draft_verify_out_cache_loc_buf = torch.empty(
             (new_cap, block_size), dtype=torch.int64, device=device
         )
-        verify_budget = int(self.verify_budget)
+        # Adaptive tiers share one max-width staging allocation. Runtime views
+        # slice this storage to the active verification width.
+        verify_budget = int(self.block_size)
         self._verify_tokens_buf = torch.empty(
             (new_cap, verify_budget), dtype=torch.long, device=device
         )
@@ -1601,7 +1734,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             ),
         )
         device = self.device
-        block_size = int(self.verify_budget)
+        block_size = int(self.block_size)
         self._accept_len_buf = torch.empty((new_cap,), dtype=torch.int32, device=device)
         self._commit_lens_bufs = [
             torch.empty((new_cap,), dtype=torch.int32, device=device) for _ in range(2)
@@ -1640,7 +1773,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             self._accept_len_buf[:bs],
             self._commit_lens_bufs[slot][:bs],
             self._bonus_id_bufs[slot][:bs],
-            self._out_tokens_bufs[slot][:bs],
+            self._out_tokens_bufs[slot][:bs, : self.verify_budget],
             self._new_seq_lens_bufs[slot][:bs],
         )
 
@@ -1796,6 +1929,7 @@ class DFlashWorkerV2(BaseSpecWorker):
 
         bs = len(batch.seq_lens)
         device = self.device
+        self.activate_step_by_batch(bs)
 
         # --- 1) Draft a fixed block with the draft model.
         target_model = self.target_worker.model_runner.model
@@ -1997,9 +2131,11 @@ class DFlashWorkerV2(BaseSpecWorker):
         assert self._verify_tokens_buf is not None
         assert self._verify_positions_buf is not None
         assert self._verify_out_cache_loc_buf is not None
-        verify_tokens = self._verify_tokens_buf[:bs]
-        verify_positions_2d = self._verify_positions_buf[:bs]
-        verify_out_cache_loc_2d = self._verify_out_cache_loc_buf[:bs]
+        verify_tokens = self._verify_tokens_buf[:bs, :verify_budget]
+        verify_positions_2d = self._verify_positions_buf[:bs, :verify_budget]
+        verify_out_cache_loc_2d = self._verify_out_cache_loc_buf[
+            :bs, :verify_budget
+        ]
         verify_tokens.copy_(draft_tokens[:, :verify_budget])
         verify_positions_2d.copy_(positions_2d[:, :verify_budget])
         verify_out_cache_loc_2d.copy_(

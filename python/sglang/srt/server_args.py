@@ -2771,6 +2771,14 @@ class ServerArgs:
         "Enable the ReplaySSM spec-verify: fold-every-commit -- a per-slot raw-input window replaces the recurrent verify's per-draft full-state snapshots. GDN or KDA hybrid linear-attn models, linear-chain (--speculative-eagle-topk in {None, 1}) only.",
         NS("exec.mamba"),
     ] = False
+    linear_replayssm_spec_mode: A[
+        str,
+        Arg(
+            help="ReplaySSM speculative state policy: eager_fold materializes every accepted verify prefix; deferred retains a bounded exact raw-input log and folds only before overflow.",
+            choices=["eager_fold", "deferred"],
+        ),
+        NS("exec.mamba"),
+    ] = "eager_fold"
 
     # -------------------------------------------------------------------------
     # Hierarchical cache
@@ -6869,6 +6877,21 @@ class ServerArgs:
         # --linear-replayssm-cache-len window and folds via its own fused
         # verify ring-write + commit_kda_replayssm_after_verify.
         if cfg.enable_linear_replayssm_spec:
+            if cfg.linear_replayssm_spec_mode == "deferred":
+                draft_tokens = cfg.speculative_num_draft_tokens or 1
+                if cfg.linear_replayssm_cache_len < 2 * draft_tokens:
+                    raise ValueError(
+                        "deferred ReplaySSM requires --linear-replayssm-cache-len "
+                        "to be at least twice the maximum verify width: "
+                        f"{cfg.linear_replayssm_cache_len} < 2 * {draft_tokens}."
+                    )
+                if not cfg.disable_radix_cache:
+                    raise ValueError(
+                        "deferred ReplaySSM cannot publish an exact mid-window "
+                        "radix checkpoint yet; use eager_fold for cache-heavy "
+                        "serving or add --disable-radix-cache for isolated kernel "
+                        "experiments."
+                    )
             if cfg.speculative_eagle_topk not in (None, 1):
                 raise ValueError(
                     "--enable-linear-replayssm-spec requires a linear draft chain "
@@ -9882,7 +9905,10 @@ class ServerArgs:
             return memo
         if cfg.speculative_num_draft_tokens is None:
             result = None
-        elif not cfg.speculative_adaptive:
+        elif (
+            not cfg.speculative_adaptive
+            or cfg.speculative_algorithm == "DFLASH"
+        ):
             result = cfg.speculative_num_draft_tokens
         else:
             from sglang.srt.speculative.adaptive_spec_params import (

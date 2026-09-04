@@ -209,7 +209,13 @@ def handle_speculative_decoding(server_args: ServerArgs) -> None:
 
     if cfg.speculative_adaptive:
         _maybe_disable_adaptive(server_args)
-        if cfg.speculative_adaptive:
+        # DFlash owns a fixed, trained draft block. Its adaptive controller
+        # changes only the target verify prefix after _handle_dflash resolves
+        # that block; the EAGLE initializer would incorrectly rewrite it.
+        if (
+            cfg.speculative_adaptive
+            and cfg.speculative_algorithm != "DFLASH"
+        ):
             _init_adaptive_speculative_params(server_args)
 
     if algo is not None:

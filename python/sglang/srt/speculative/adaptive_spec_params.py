@@ -46,6 +46,16 @@ DEFAULT_ADAPTIVE_CONFIG: dict[str, dict] = {
     },
 }
 
+# DFlash keeps the draft model at its trained block width and adapts only the
+# target verification prefix.  These slots are deliberately batch-aware: wide
+# batches never capture or select the deepest verifier graph.
+DEFAULT_DFLASH_ADAPTIVE_CONFIG: dict[str, dict] = {
+    "1": {"candidate_steps": [3, 4, 5]},
+    "6": {"candidate_steps": [3, 4, 5]},
+    "14": {"candidate_steps": [4, 5]},
+    "24": {"candidate_steps": [5]},
+}
+
 
 def adaptive_unsupported_reason(server_args: ServerArgs) -> str | None:
     """Return why adaptive spec cannot run under the given server args, or None if supported."""
@@ -54,10 +64,10 @@ def adaptive_unsupported_reason(server_args: ServerArgs) -> str | None:
     cfg = resolving_view(server_args)
     from sglang.srt.arg_groups.overrides import resolved_view
 
-    if cfg.speculative_algorithm not in ("EAGLE", "EAGLE3"):
+    if cfg.speculative_algorithm not in ("EAGLE", "EAGLE3", "DFLASH"):
         return (
             f"speculative_algorithm={cfg.speculative_algorithm} "
-            "(only EAGLE/EAGLE3 are supported)"
+            "(only EAGLE/EAGLE3/DFLASH are supported)"
         )
     if cfg.speculative_eagle_topk is not None and cfg.speculative_eagle_topk != 1:
         return (
@@ -89,6 +99,7 @@ def adaptive_unsupported_reason(server_args: ServerArgs) -> str | None:
 
 def _load_adaptive_config(
     cfg_path: str | None,
+    default_config: dict[str, dict] | None = None,
 ) -> tuple[dict, dict[int, dict]]:
     """Load and validate adaptive config.
 
@@ -98,7 +109,7 @@ def _load_adaptive_config(
         with open(cfg_path) as f:
             cfg = json.load(f)
     else:
-        cfg = DEFAULT_ADAPTIVE_CONFIG
+        cfg = default_config or DEFAULT_ADAPTIVE_CONFIG
 
     bs_entries: dict[int, dict] = {}
     for key, entry in cfg.items():
@@ -269,8 +280,28 @@ class AdaptiveSpeculativeParams:
         self,
         initial_steps: int,
         cfg_path: str | None = None,
+        dflash_block_size: int | None = None,
     ):
-        cfg, bs_entries = _load_adaptive_config(cfg_path)
+        default_config = (
+            DEFAULT_DFLASH_ADAPTIVE_CONFIG
+            if dflash_block_size is not None
+            else DEFAULT_ADAPTIVE_CONFIG
+        )
+        cfg, bs_entries = _load_adaptive_config(cfg_path, default_config)
+        if dflash_block_size is not None:
+            invalid = sorted(
+                {
+                    step
+                    for entry in bs_entries.values()
+                    for step in entry["candidate_steps"]
+                    if step + 1 > dflash_block_size
+                }
+            )
+            if invalid:
+                raise ValueError(
+                    "DFlash adaptive verify widths cannot exceed the draft model "
+                    f"block size {dflash_block_size}; invalid candidate_steps={invalid}"
+                )
         self._bs_list: list[int] = sorted(bs_entries)
         self._slots: dict[int, AdaptiveStepSlot] = {}
         self._cuda_graph_bs: list[int] | None = None

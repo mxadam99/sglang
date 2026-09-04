@@ -1273,6 +1273,35 @@ class HybridLinearAttnBackend(AttentionBackend):
             )
             return
 
+        if (
+            getattr(mamba_pool, "replayssm_cache_base", None) is not None
+            and not getattr(mamba_pool, "replayssm_is_kda", False)
+        ):
+            from sglang.kernels.ops.attention.fla.gdn_replayssm_spec_decode import (
+                commit_gdn_replayssm_spec,
+            )
+            from sglang.kernels.ops.mamba.mamba_state_scatter_triton import (
+                fused_conv_window_scatter_with_mask,
+            )
+
+            commit_gdn_replayssm_spec(
+                write_pos=mamba_pool.replayssm_write_pos,
+                cache_base=mamba_pool.replayssm_cache_base,
+                is_flush=mamba_pool.replayssm_is_flush,
+                num_accepted=last_correct_step_indices + 1,
+                state_batch_indices=state_indices_tensor,
+                max_cache_len=mamba_caches.replayssm_d.shape[-2],
+                max_spec_len=mamba_caches.intermediate_conv_window[0].shape[2],
+                null_block_id=-1,
+            )
+            fused_conv_window_scatter_with_mask(
+                mamba_caches.conv[0],
+                mamba_caches.intermediate_conv_window[0],
+                state_indices_tensor,
+                last_correct_step_indices,
+            )
+            return
+
         if getattr(mamba_pool, "replayssm_is_kda", False):
             from sglang.kernels.ops.attention.fla.kda_replayssm_spec_decode import (
                 commit_kda_replayssm_after_verify,

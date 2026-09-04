@@ -830,6 +830,7 @@ class KVCacheConfigurator:
                     or kimi_linear_config(self.model_config) is not None
                 )
             ),
+            linear_replayssm_spec_mode=get_exec().mamba.linear_replayssm_spec_mode,
         )
         return req_to_token_pool
 
@@ -918,6 +919,7 @@ class KVCacheConfigurator:
                     or kimi_linear_config(self.model_config) is not None
                 )
             ),
+            linear_replayssm_spec_mode=get_exec().mamba.linear_replayssm_spec_mode,
         )
         return req_to_token_pool
 

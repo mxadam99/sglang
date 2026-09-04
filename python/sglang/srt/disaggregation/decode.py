@@ -238,6 +238,7 @@ class HybridMambaDecodeReqToTokenPool(HybridReqToTokenPool):
         linear_replayssm_cache_len: int = 16,
         mamba_envelope_layout: bool = False,
         enable_linear_replayssm_spec: bool = False,
+        linear_replayssm_spec_mode: str = "eager_fold",
     ):
         DecodeReqToTokenPool.__init__(
             self,
@@ -285,6 +286,7 @@ class HybridMambaDecodeReqToTokenPool(HybridReqToTokenPool):
             linear_replayssm_cache_len=linear_replayssm_cache_len,
             mamba_envelope_layout=mamba_envelope_layout,
             enable_linear_replayssm_spec=enable_linear_replayssm_spec,
+            linear_replayssm_spec_mode=linear_replayssm_spec_mode,
         )
 
     def clear(self):

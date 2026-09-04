@@ -73,9 +73,16 @@ class AdaptiveController:
 
     def __init__(self, worker: AdaptiveSpecWorker, config_path: str | None = None):
         self.worker = worker
+        dflash_block_size = getattr(worker, "dflash_block_size", None)
+        initial_steps = (
+            dflash_block_size - 1
+            if dflash_block_size is not None
+            else worker.speculative_num_steps
+        )
         self.params = AdaptiveSpeculativeParams(
-            initial_steps=worker.speculative_num_steps,
+            initial_steps=initial_steps,
             cfg_path=config_path,
+            dflash_block_size=dflash_block_size,
         )
         self._states: dict[int, SpecRuntimeState] = {}
 
@@ -108,7 +115,11 @@ class AdaptiveController:
             self._states[steps] = state
 
         # Start on the initial step.
-        self._activate(self.worker.speculative_num_steps)
+        self._activate(
+            self.worker.dflash_block_size - 1
+            if getattr(self.worker, "dflash_block_size", None) is not None
+            else self.worker.speculative_num_steps
+        )
 
     def activate_step_by_batch(self, batch_size: int) -> None:
         target = self.params.get_steps_for_batch(batch_size)
