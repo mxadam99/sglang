@@ -379,6 +379,18 @@ class NgramEmbeddingInfo:
         )
 
 
+def _mrope_delta_on_device(
+    mm_input: MultimodalInputs, device, refresh: bool = False
+) -> torch.Tensor:
+    """Every writer of `mrope_position_delta` either runs before the extend that
+    refreshes this copy, or clears it (see `MultimodalInputs.merge`)."""
+    cached = mm_input.mrope_position_delta_device
+    if cached is None or refresh:
+        cached = mm_input.mrope_position_delta.to(device=device, non_blocking=True)
+        mm_input.mrope_position_delta_device = cached
+    return cached
+
+
 @dataclass
 class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     """Store all inputs of a forward pass."""
@@ -1092,9 +1104,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         else:
             mrope_deltas = [
                 (
-                    torch.zeros(1, dtype=torch.int64)
+                    torch.zeros(1, dtype=torch.int64, device=device)
                     if mm_inputs[i] is None
-                    else mm_inputs[i].mrope_position_delta.squeeze(0)
+                    else _mrope_delta_on_device(mm_inputs[i], device).squeeze(0)
                 )
                 for i in range(batch_size)
             ]
@@ -1166,6 +1178,12 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             raise RuntimeError(
                 f"_compute_mrope_positions called with unsupported forward_mode: {forward_mode}"
             )
+
+        # Extend-only: decode reaching here would re-upload every step, which
+        # is exactly what the device copy exists to avoid.
+        for mm_input in batch.multimodal_inputs:
+            if mm_input is not None and mm_input.mrope_position_delta is not None:
+                _mrope_delta_on_device(mm_input, model_runner.device, refresh=True)
 
         self._compute_mrope_positions_extend(model_runner, batch)
 
