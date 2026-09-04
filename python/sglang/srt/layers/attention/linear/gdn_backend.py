@@ -704,18 +704,11 @@ class GDNAttnBackend(MambaAttnBackendBase):
             and (
                 not conv_states.is_contiguous()
                 or not ssm_states.is_contiguous()
-                or getattr(mamba_pool, "replayssm_checkpoint_index", None) is not None
             )
         )
         if needs_state_gather:
             conv_states_contig = conv_states[cache_indices].contiguous()
-            checkpoint_indices = getattr(mamba_pool, "replayssm_checkpoint_index", None)
-            ssm_source_indices = (
-                checkpoint_indices[cache_indices]
-                if checkpoint_indices is not None
-                else cache_indices
-            )
-            ssm_states_contig = ssm_states[ssm_source_indices].contiguous()
+            ssm_states_contig = ssm_states[cache_indices].contiguous()
             state_cache_indices = torch.arange(
                 cache_indices.shape[0],
                 device=cache_indices.device,
@@ -1099,6 +1092,9 @@ class GDNAttnBackend(MambaAttnBackendBase):
             # index (valid slots start at 0), so the kernel's "null block"
             # sentinel is -1, not the vLLM default of 0.
             null_block_id=-1,
+            # Capacity/radix folds run once across all layers after acceptance;
+            # verify therefore only appends compact history and reconstructs output.
+            launch_mode="verify",
         )
         # Match the recurrent target_verify output shape (== value.shape).
         return out.reshape(value.shape)

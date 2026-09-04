@@ -2819,8 +2819,8 @@ class ServerArgs:
     linear_replayssm_spec_mode: A[
         str,
         Arg(
-            help="ReplaySSM speculative state policy: eager_fold materializes every accepted verify prefix; deferred uses the legacy shared circular window; split_deferred separates the bounded committed log from proposal scratch so L may be smaller than 2K.",
-            choices=["eager_fold", "deferred", "split_deferred"],
+            help="ReplaySSM speculative state policy: eager_fold materializes every accepted verify prefix; deferred uses request-indexed compensated circular history.",
+            choices=["eager_fold", "deferred"],
         ),
         NS("exec.mamba"),
     ] = "eager_fold"
@@ -6936,7 +6936,7 @@ class ServerArgs:
         # verify ring-write + commit_kda_replayssm_after_verify.
         if cfg.enable_linear_replayssm_spec:
             if (
-                cfg.linear_replayssm_spec_mode in ("deferred", "split_deferred")
+                cfg.linear_replayssm_spec_mode == "deferred"
                 and cfg.linear_replayssm_cache_len
                 & (cfg.linear_replayssm_cache_len - 1)
                 != 0
@@ -6953,20 +6953,6 @@ class ServerArgs:
                         "deferred ReplaySSM requires --linear-replayssm-cache-len "
                         "to be at least twice the maximum verify width: "
                         f"{cfg.linear_replayssm_cache_len} < 2 * {draft_tokens}."
-                    )
-            elif cfg.linear_replayssm_spec_mode == "split_deferred":
-                if cfg.linear_replayssm_cache_len < 1:
-                    raise ValueError(
-                        "split-deferred ReplaySSM requires a non-empty committed "
-                        "log; got --linear-replayssm-cache-len="
-                        f"{cfg.linear_replayssm_cache_len}."
-                    )
-                if not cfg.disable_radix_cache:
-                    raise ValueError(
-                        "deferred ReplaySSM cannot publish an exact mid-window "
-                        "radix checkpoint yet; use eager_fold for cache-heavy "
-                        "serving or add --disable-radix-cache for isolated kernel "
-                        "experiments."
                     )
             if cfg.speculative_eagle_topk not in (None, 1):
                 raise ValueError(
