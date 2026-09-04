@@ -2210,7 +2210,7 @@ class ServerArgs:
     ] = False
     speculative_dflash_suffix_oracle: A[
         bool,
-        "DFLASH only. Use a bounded committed-output suffix corpus as a first proposal source and run the draft model only for miss rows. Greedy decoding only.",
+        "DFLASH only. Asynchronously consult a bounded committed-output suffix corpus and select suffix or DFlash proposals on device. Greedy decoding only.",
         NS("spec"),
     ] = False
     speculative_dflash_suffix_max_depth: A[
@@ -2243,6 +2243,11 @@ class ServerArgs:
         "DFLASH_CONFIDENCE only. Fill compact ragged verification to its CUDA Graph token bucket.",
         NS("spec"),
     ] = False
+    speculative_dflash_confidence_min_batch_size: A[
+        int,
+        "DFLASH_CONFIDENCE only. Minimum live request batch for ragged confidence scheduling; smaller batches retain fixed-width verification.",
+        NS("spec"),
+    ] = 12
     speculative_dspark_block_size: A[
         Optional[int],
         "DSPARK only. Draft block size gamma (number of proposed draft tokens). The verify window is gamma + 1, so this sets --speculative-num-draft-tokens = gamma + 1. Omit to auto-infer gamma from the draft checkpoint block_size.",

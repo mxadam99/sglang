@@ -74,6 +74,7 @@ from sglang.srt.speculative.dflash_confidence_observability import (
 )
 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
+from sglang.srt.speculative.dflash_suffix_pipeline import DFlashSuffixPipeline
 from sglang.srt.speculative.dflash_utils import (
     apply_dflash_simulated_acceptance,
     apply_dflash_verify_logits_adjustments,
@@ -590,6 +591,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._warned_sampling_fallback = False
         self._draft_probs_buf = None
         self._selector_confidence = None
+        self._active_batch_size = 0
         # SPS profiling pins the optional-token budget to sample the compact
         # DFLASH_CONFIDENCE cost surface T(num_requests, verify_tokens).
         # Normal serving leaves this unset and uses the configured SPS policy.
@@ -645,7 +647,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             get_spec().speculative_dflash_verify_budget or self.block_size
         )
         self._suffix_corpus = None
-        self._suffix_prev_rids: set[str] = set()
+        self._suffix_pipeline: Optional[DFlashSuffixPipeline] = None
         if get_spec().speculative_dflash_suffix_oracle:
             from sglang.srt.speculative.cpp_ngram.ngram_corpus import NgramCorpus
 
@@ -656,6 +658,12 @@ class DFlashWorkerV2(BaseSpecWorker):
                 draft_token_num=self.block_size,
                 match_type="PROB",
                 capacity=get_spec().speculative_dflash_suffix_capacity,
+            )
+            self._suffix_pipeline = DFlashSuffixPipeline(
+                corpus=self._suffix_corpus,
+                device=self.device,
+                width=self.block_size,
+                max_depth=get_spec().speculative_dflash_suffix_max_depth,
             )
         self.adaptive_controller: Optional[AdaptiveController] = None
         if get_spec().speculative_adaptive:
@@ -937,6 +945,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         )
 
     def activate_step_by_batch(self, batch_size: int) -> None:
+        self._active_batch_size = int(batch_size)
         if self.adaptive_controller is not None:
             self.adaptive_controller.activate_step_by_batch(batch_size)
 
@@ -985,7 +994,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 block_size=self.block_size,
                 max_bs=max(get_exec().graph.cuda_graph_config.decode.bs),
                 device=self.device,
-                enable_confidence=self._uses_confidence_scheduling(),
+                enable_confidence=self._confidence_capable(),
             )
         if not hasattr(lm_head, "weight"):
             return _eager("quantized lm_head has no dense weight")
@@ -1168,66 +1177,19 @@ class DFlashWorkerV2(BaseSpecWorker):
         # sliding-window path, the draft req->token view is rebuilt from committed
         # target state before each draft forward, so there is nothing persistent
         # to flush here.
-        if self._suffix_corpus is not None:
-            self._suffix_corpus.reset()
-            self._suffix_prev_rids.clear()
+        if self._suffix_pipeline is not None:
+            self._suffix_pipeline.reset()
 
     def _suffix_oracle_candidates(self, batch: ScheduleBatch):
-        """Return full-chain committed suffix hits and miss row indices.
-
-        Corpus lookup stays on the scheduler CPU, but candidate transfer is
-        asynchronous. Only greedy, grammar-free batches are eligible: greedy
-        target verification makes an arbitrary proposal distribution exact,
-        while stochastic acceptance would require an oracle q-distribution.
-        """
-        corpus = self._suffix_corpus
+        """Return suffix candidates and a device-resident hit mask."""
+        pipeline = self._suffix_pipeline
         if (
-            corpus is None
+            pipeline is None
             or batch.has_grammar
             or not _is_all_greedy(batch.sampling_info)
         ):
             return None
-
-        depth = get_spec().speculative_dflash_suffix_max_depth
-        tails = [
-            (list(req.origin_input_ids) + list(req.output_ids))[-depth:]
-            for req in batch.reqs
-        ]
-        if any(not tail for tail in tails):
-            return None
-        corpus.synchronize()
-        ids, masks = corpus.batch_get(
-            [req.rid for req in batch.reqs],
-            tails,
-            [len(req.origin_input_ids) + len(req.output_ids) for req in batch.reqs],
-        )
-        # Learn only committed output streams, after querying them, so prompt
-        # text never becomes an oracle source and a tail cannot manufacture its
-        # own continuation in the same round.
-        committed = [list(req.output_ids[-depth:]) for req in batch.reqs]
-        committed = [tokens for tokens in committed if len(tokens) >= 2]
-        if committed:
-            corpus.batch_put(committed)
-
-        bs = len(batch.reqs)
-        width = self.block_size
-        budget = self.verify_budget
-        tree = masks.reshape(bs, width, width)
-        hit = tree[:, budget - 1, :budget].all(axis=1)
-        current_rids = {req.rid for req in batch.reqs}
-        departed = self._suffix_prev_rids - current_rids
-        if departed:
-            corpus.erase_match_state(list(departed))
-        self._suffix_prev_rids = current_rids
-        if not bool(hit.any()):
-            return None
-
-        hit_rows = np.flatnonzero(hit).tolist()
-        miss_rows = np.flatnonzero(~hit).tolist()
-        proposals = torch.from_numpy(ids.reshape(bs, width)).to(
-            self.device, dtype=torch.int64, non_blocking=True
-        )
-        return proposals, hit_rows, miss_rows
+        return pipeline.candidates(batch)
 
     def _gather_req_to_token_masked(
         self,
@@ -1538,6 +1500,11 @@ class DFlashWorkerV2(BaseSpecWorker):
         return tokens
 
     def _uses_confidence_scheduling(self) -> bool:
+        return self._confidence_capable() and self._active_batch_size >= int(
+            self.server_args.speculative_dflash_confidence_min_batch_size
+        )
+
+    def _confidence_capable(self) -> bool:
         return self.server_args.speculative_algorithm == "DFLASH_CONFIDENCE"
 
     def _load_confidence_sps_table(self):
@@ -1651,7 +1618,9 @@ class DFlashWorkerV2(BaseSpecWorker):
         current decode step retains confidence on device for its own top-k
         per-request allocation, avoiding a D2H synchronization.
         """
-        if not self._uses_confidence_scheduling():
+        if not self._confidence_capable() or len(batch.reqs) < int(
+            self.server_args.speculative_dflash_confidence_min_batch_size
+        ):
             return
         draft_input = batch.spec_info
         if draft_input is None:
@@ -1679,12 +1648,12 @@ class DFlashWorkerV2(BaseSpecWorker):
     def get_confidence_budget_prepare(self):
         return (
             self._prepare_confidence_verify_budget
-            if self._uses_confidence_scheduling()
+            if self._confidence_capable()
             else None
         )
 
     def dump_info_records(self) -> Optional[dict]:
-        if not self._uses_confidence_scheduling():
+        if not self._confidence_capable():
             return None
         return self._confidence_observer.dump()
 
@@ -2660,50 +2629,24 @@ class DFlashWorkerV2(BaseSpecWorker):
         draft_tokens[:, 0].copy_(block_ids[:, 0])
         oracle = self._suffix_oracle_candidates(batch)
         oracle_tokens = None
-        hit_rows: list[int] = []
-        miss_rows = list(range(bs))
+        suffix_hit_mask = None
         if oracle is not None:
-            oracle_tokens, hit_rows, miss_rows = oracle
-            hit_index = torch.tensor(hit_rows, device=device, dtype=torch.int64)
-            draft_tokens[hit_index] = oracle_tokens[hit_index]
-            # The authoritative bonus token is device-resident and may be one
-            # scheduler iteration newer than the host request tail.
-            draft_tokens[hit_index, 0] = block_ids[hit_index, 0]
+            oracle_tokens, suffix_hit_mask = oracle
 
-        # Miss compaction is graph-safe only when the captured sampler owns the
-        # draft head. Eager fallback still gets the acceptance benefit by
-        # drafting the full batch and overwriting suffix-hit rows below.
-        compact_misses = oracle is not None and self._draft_sampler is not None
-        draft_rows = miss_rows if compact_misses else list(range(bs))
-        draft_bs = len(draft_rows)
+        # DFlash is the unconditional miss source.  Keeping its graph at the
+        # full batch width avoids a CPU hit-mask readback and variable-batch
+        # recapture; suffix arbitration happens after draft sampling on device.
+        draft_bs = bs
         self._selector_sample = None
         self._selector_confidence = None
         if draft_bs:
-            if draft_bs == bs:
-                row_index = None
-                draft_block_ids = block_ids
-                draft_positions = positions
-                draft_cache_loc = verify_out_cache_loc
-                draft_req_pool_indices = batch.req_pool_indices
-                selected_seq_lens = draft_seq_lens
-                selected_seq_lens_cpu = seq_lens_cpu
-                selected_seq_lens_sum = draft_seq_lens_sum
-            else:
-                row_index = torch.tensor(draft_rows, device=device, dtype=torch.int64)
-                row_index_cpu = torch.tensor(
-                    draft_rows, device="cpu", dtype=torch.int64
-                )
-                draft_block_ids = block_ids.index_select(0, row_index)
-                draft_positions = positions_2d.index_select(0, row_index).reshape(-1)
-                draft_cache_loc = verify_out_cache_loc_2d.index_select(
-                    0, row_index
-                ).reshape(-1)
-                draft_req_pool_indices = batch.req_pool_indices.index_select(
-                    0, row_index
-                )
-                selected_seq_lens = draft_seq_lens.index_select(0, row_index)
-                selected_seq_lens_cpu = seq_lens_cpu.index_select(0, row_index_cpu)
-                selected_seq_lens_sum = int(selected_seq_lens_cpu.sum())
+            draft_block_ids = block_ids
+            draft_positions = positions
+            draft_cache_loc = verify_out_cache_loc
+            draft_req_pool_indices = batch.req_pool_indices
+            selected_seq_lens = draft_seq_lens
+            selected_seq_lens_cpu = seq_lens_cpu
+            selected_seq_lens_sum = draft_seq_lens_sum
 
             noise_embedding = embed_module(draft_block_ids)
             if self._noise_embed_scale != 1.0:
@@ -2770,14 +2713,24 @@ class DFlashWorkerV2(BaseSpecWorker):
                     lm_head=lm_head,
                 ).view(draft_bs, int(self.block_size) - 1)
 
-            if row_index is None:
-                draft_tokens[:, 1:].copy_(draft_next)
-            else:
-                draft_tokens[row_index, 1:] = draft_next
-            if oracle_tokens is not None:
-                hit_index = torch.tensor(hit_rows, device=device, dtype=torch.int64)
-                draft_tokens[hit_index] = oracle_tokens[hit_index]
-                draft_tokens[hit_index, 0] = block_ids[hit_index, 0]
+            draft_tokens[:, 1:].copy_(draft_next)
+            if oracle_tokens is not None and suffix_hit_mask is not None:
+                torch.where(
+                    suffix_hit_mask[:, None],
+                    oracle_tokens,
+                    draft_tokens,
+                    out=draft_tokens,
+                )
+                # The current anchor came through FutureMap and is newer than
+                # the host corpus context under overlap scheduling.
+                draft_tokens[:, 0].copy_(block_ids[:, 0])
+                if self._selector_confidence is not None:
+                    torch.where(
+                        suffix_hit_mask[:, None],
+                        torch.ones_like(self._selector_confidence),
+                        self._selector_confidence,
+                        out=self._selector_confidence,
+                    )
 
         # --- 2) Target verify.
         # TARGET_VERIFY uses standard causal masking; custom masks are unnecessary here.
@@ -3281,6 +3234,13 @@ class DFlashWorkerV2(BaseSpecWorker):
                 on_publish(new_seq_lens, confidence=self._selector_confidence)
             else:
                 on_publish(new_seq_lens)
+
+        if self._suffix_pipeline is not None:
+            self._suffix_pipeline.stage_committed(
+                req_ids=[req.rid for req in batch.reqs],
+                tokens=out_tokens,
+                lengths=commit_lens,
+            )
 
         # --- 3) Materialize committed verify-input tokens into draft KV cache.
         # The all-greedy compact graph epilogue already injected the same

@@ -321,12 +321,6 @@ def _handle_dflash(server_args: ServerArgs) -> None:
         )
 
     if cfg.speculative_dflash_suffix_oracle:
-        if not cfg.disable_overlap_schedule:
-            raise ValueError(
-                "--speculative-dflash-suffix-oracle currently requires "
-                "--disable-overlap-schedule so the committed request tails are "
-                "visible before the next corpus lookup."
-            )
         if cfg.speculative_dflash_suffix_max_depth < 2:
             raise ValueError(
                 "--speculative-dflash-suffix-max-depth must be >= 2, got "
@@ -415,6 +409,14 @@ def _handle_dflash(server_args: ServerArgs) -> None:
             raise ValueError(
                 "--speculative-dflash-confidence-target-verify-tokens must be "
                 f"non-negative, got {target_tokens}."
+            )
+        min_batch_size = int(
+            server_args.speculative_dflash_confidence_min_batch_size
+        )
+        if min_batch_size < 1:
+            raise ValueError(
+                "--speculative-dflash-confidence-min-batch-size must be positive, "
+                f"got {min_batch_size}."
             )
         sps_table_path = server_args.speculative_dflash_confidence_sps_table_path
         if sps_table_path and not os.path.isfile(sps_table_path):
